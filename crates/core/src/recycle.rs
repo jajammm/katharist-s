@@ -1,7 +1,10 @@
-//! Sending files to the Recycle Bin through `IFileOperation`. `SHFileOperation`
+//! Sending items to the Recycle Bin through `IFileOperation`. `SHFileOperation`
 //! and the `trash` crate delete for good, without saying so, when an item cannot
-//! go to the bin; here the shell's own answer decides, per item, before anything
-//! happens.
+//! go to the bin. The shell's own answer is not enough either: it flags a single
+//! file too big for the bin as recyclable and then deletes it. So files and folders
+//! are checked against the bin's settings first, files also get a guard that can
+//! put them back, and only an item the shell reports creating in the bin counts as
+//! recycled. Links stay out of the bin.
 
 use std::ffi::c_void;
 use std::io;
@@ -282,6 +285,12 @@ fn shell_item_path(item: &IShellItem) -> windows_core::Result<String> {
 }
 
 fn perform(p: &Path) -> Result<RecycleOutcome, FailReason> {
+    #[cfg(test)]
+    SHELL_CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(p.to_path_buf());
+
     let shell_error = |e: windows_core::Error| reason_from_hresult(e.code());
     let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
     let item: IShellItem =
@@ -376,10 +385,17 @@ fn recycle_item(p: &Path, forced: Option<Preflight>) -> Result<RecycleOutcome, F
 
 /// A folder has no guard, so it goes to the shell only if everything says it fits.
 fn recycle_folder(p: &Path) -> Result<RecycleOutcome, FailReason> {
+    recycle_folder_with_settings(p, read_bin_settings(p))
+}
+
+fn recycle_folder_with_settings(
+    p: &Path,
+    settings: BinSettings,
+) -> Result<RecycleOutcome, FailReason> {
     let Some(logical_len) = folder_logical_len(p).map_err(io_reason)? else {
         return Err(FailReason::NotRecyclable);
     };
-    match decide_preflight(read_bin_settings(p), logical_len) {
+    match decide_preflight(settings, logical_len) {
         Preflight::Fits => perform(p),
         Preflight::Refuse | Preflight::QuotaUnknown => Err(FailReason::NotRecyclable),
     }
@@ -490,6 +506,11 @@ fn read_bin_settings(p: &Path) -> BinSettings {
 /// afterwards, so this is how a test knows the restore really ran.
 #[cfg(test)]
 pub(crate) static RESTORED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Every path handed to the shell. A refusal by the preflight and an abort by the
+/// shell give the same reason, so this is how a test tells them apart.
+#[cfg(test)]
+pub(crate) static SHELL_CALLS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// A second name for a file, created beside it for the length of the shell call.
 /// What the shell does to the original name cannot reach the data while this name
@@ -709,6 +730,56 @@ mod tests {
         assert_eq!(outcome, Err(FailReason::AccessDenied));
         assert_eq!(fs::read_to_string(&file).unwrap(), "the data");
         assert!(guard_path.exists(), "nothing could remove it");
+    }
+
+    /// Two files of 600 KiB against whatever `settings` says. Each would fit a quota
+    /// of 1 MiB; only their sum does not, so a wrong length fails the quota test.
+    ///
+    /// This runs on the test thread, where COM is not initialized: if the decision
+    /// is ever wrong, `perform` records the call and then fails to create the file
+    /// operation, so the folder still does not reach the bin.
+    fn assert_refused_before_the_shell(settings: BinSettings) {
+        let dir = Builder::new()
+            .prefix("katharistis-test-")
+            .tempdir()
+            .unwrap();
+        let top = dir.path().join("katharistis-test-folder");
+        fs::create_dir(&top).unwrap();
+        let children = [top.join("one.bin"), top.join("two.bin")];
+        for child in &children {
+            fs::write(child, vec![b'x'; 600 * 1024]).unwrap();
+        }
+
+        let outcome = recycle_folder_with_settings(&top, settings);
+
+        assert!(
+            !SHELL_CALLS.lock().unwrap().contains(&top),
+            "the shell was called for a folder that should be refused"
+        );
+        assert_eq!(outcome, Err(FailReason::NotRecyclable));
+        for child in &children {
+            assert_eq!(fs::metadata(child).unwrap().len(), 600 * 1024);
+        }
+    }
+
+    #[test]
+    fn folder_preflight_refuses_an_unknown_quota_before_the_shell() {
+        assert_refused_before_the_shell(settings(Some(false), None));
+    }
+
+    #[test]
+    fn folder_preflight_refuses_unknown_bin_state_before_the_shell() {
+        assert_refused_before_the_shell(settings(None, Some(1000)));
+    }
+
+    #[test]
+    fn folder_preflight_refuses_a_turned_off_bin_before_the_shell() {
+        assert_refused_before_the_shell(settings(Some(true), Some(1000)));
+    }
+
+    #[test]
+    fn folder_preflight_refuses_a_sum_over_the_quota_before_the_shell() {
+        assert_refused_before_the_shell(settings(Some(false), Some(1)));
     }
 
     #[test]

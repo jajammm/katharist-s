@@ -31,8 +31,9 @@ pub enum FailReason {
     InUse,
     AccessDenied,
     NotRecyclable,
-    /// The shell deleted the file and it could not be put back under its name. The
-    /// data is safe, at this path.
+    /// The guard was left at this path and the file was not confirmed back under its
+    /// name: the restore failed, the guard could not be read, or a different file
+    /// sits at the original name. The file's data may be only here.
     GuardKept(PathBuf),
     Other(String),
 }
@@ -265,7 +266,9 @@ pub fn delete(targets: &[Target], mode: DeleteMode, ctx: &ProtectContext) -> Del
 mod tests {
     use super::*;
     use crate::protect::canonical_for_delete;
-    use crate::recycle::{bin_info, real_quota_bytes, recycle_with_unknown_quota, RESTORED};
+    use crate::recycle::{
+        bin_info, real_quota_bytes, recycle_with_unknown_quota, RESTORED, SHELL_CALLS,
+    };
     use crate::{scan, win};
     use std::fs;
     use std::io::{Read, Write};
@@ -364,6 +367,10 @@ mod tests {
         let mut perms = fs::metadata(p).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(p, perms).unwrap();
+    }
+
+    fn shell_was_called_for(p: &Path) -> bool {
+        SHELL_CALLS.lock().unwrap().iter().any(|call| call == p)
     }
 
     fn assert_no_guard(dir: &Path) {
@@ -759,6 +766,7 @@ mod tests {
 
         let r = del(&[t(&link)], DeleteMode::RecycleBin, &ctx());
 
+        assert!(!shell_was_called_for(&link));
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert!(r.recycled.is_empty() && r.removed.is_empty());
@@ -786,6 +794,7 @@ mod tests {
 
         let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
 
+        assert!(!shell_was_called_for(&top));
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert!(own.exists() && keep.exists());
@@ -877,6 +886,7 @@ mod tests {
         let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
 
         eprintln!("{child} bytes twice against a quota of {quota}: {r:?}");
+        assert!(!shell_was_called_for(&top));
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         for path in &children {
@@ -954,6 +964,8 @@ mod tests {
 
         let r = del(&[t(&file_on_subst)], DeleteMode::RecycleBin, &ctx());
         eprintln!("file on a subst drive: {r:?}");
+        // Also shows the record uses the spelling the other tests look for.
+        assert!(shell_was_called_for(&file_on_subst));
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert_eq!(r.failed[0].path, file_on_subst);
