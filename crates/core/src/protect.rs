@@ -237,6 +237,15 @@ pub fn canonical_for_delete(p: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(render(&parent, std::slice::from_ref(last))))
 }
 
+/// `p` as Win32 would read it, with `.`, `..`, `/` and any `\\?\` prefix gone but
+/// nothing resolved. Unlike [`canonical_for_delete`] this keeps the drive letter a
+/// path was given on, which matters to the shell: a `subst` drive has no Recycle
+/// Bin, while the folder it maps to may have one. Not a substitute for the gate.
+pub(crate) fn lexical_spelling(p: &Path) -> Option<PathBuf> {
+    let lexical = Lexical::parse(p)?;
+    Some(PathBuf::from(render(&lexical.root, &lexical.components)))
+}
+
 /// Every key a context entry may appear under: as configured and with reparse
 /// points followed, since [`canonical_for_delete`] reports resolved paths. This
 /// is what makes a profile or own folder behind a junction still match.

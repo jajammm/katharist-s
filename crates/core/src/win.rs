@@ -6,16 +6,32 @@ use std::path::{Component, Path, Prefix};
 use std::time::{Duration, SystemTime};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, FILETIME, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
-    FindNextFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, GetLongPathNameW, BY_HANDLE_FILE_INFORMATION,
+    CreateFileW, CreateHardLinkW, DeleteFileW, FileDispositionInfoEx, FindClose, FindExInfoBasic,
+    FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW,
+    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW,
+    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, MoveFileExW, RemoveDirectoryW,
+    SetFileAttributesW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+    FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAGS_AND_ATTRIBUTES,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FIND_FIRST_EX_LARGE_FETCH, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
-    WIN32_FIND_DATAW,
+    FIND_FIRST_EX_LARGE_FETCH, GETFINALPATHNAMEBYHANDLE_FLAGS, MOVE_FILE_FLAGS, OPEN_EXISTING,
+    VOLUME_NAME_DOS, WIN32_FIND_DATAW,
 };
+
+/// `*`, `?` and the three characters Win32 also treats as DOS wildcards.
+const WILDCARDS: [u16; 5] = [
+    b'*' as u16,
+    b'?' as u16,
+    b'<' as u16,
+    b'>' as u16,
+    b'"' as u16,
+];
 
 fn to_wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(Some(0)).collect()
@@ -196,6 +212,170 @@ pub fn list_dir(p: &Path) -> io::Result<Vec<DirEntry>> {
     result.map(|()| out)
 }
 
+/// The directory entry of `p` itself, without following it if it is a link. The
+/// name is passed to `FindFirstFileExW`, which would read a wildcard as a pattern
+/// and answer about some other file, so wildcards are refused.
+pub fn entry_info(p: &Path) -> io::Result<DirEntry> {
+    let has_wildcard = p
+        .file_name()
+        .is_some_and(|name| name.encode_wide().any(|c| WILDCARDS.contains(&c)));
+    if has_wildcard {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wildcard in file name",
+        ));
+    }
+    let wide = to_long_path(p);
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe {
+        FindFirstFileExW(
+            PCWSTR(wide.as_ptr()),
+            FindExInfoBasic,
+            &mut data as *mut _ as *mut c_void,
+            FindExSearchNameMatch,
+            None,
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    }
+    .map_err(io::Error::from)?;
+    let _ = unsafe { FindClose(handle) };
+    let len = data
+        .cFileName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(data.cFileName.len());
+    Ok(DirEntry {
+        name: String::from_utf16_lossy(&data.cFileName[..len]),
+        attrs: data.dwFileAttributes,
+        reparse_tag: data.dwReserved0,
+        modified: filetime_to_system(data.ftLastWriteTime),
+    })
+}
+
+/// `DeleteFileW`. On a file symlink this removes the link.
+pub(crate) fn delete_file(p: &Path) -> io::Result<()> {
+    let wide = to_long_path(p);
+    unsafe { DeleteFileW(PCWSTR(wide.as_ptr())) }.map_err(io::Error::from)
+}
+
+/// `RemoveDirectoryW`. On a junction or directory symlink this removes the link
+/// and leaves its target alone; a real directory must already be empty.
+pub(crate) fn remove_directory(p: &Path) -> io::Result<()> {
+    let wide = to_long_path(p);
+    unsafe { RemoveDirectoryW(PCWSTR(wide.as_ptr())) }.map_err(io::Error::from)
+}
+
+/// `SetFileAttributesW`, which sets the attributes of a link rather than of what
+/// it points at. Bits it cannot set, such as the directory bit, are ignored.
+pub(crate) fn set_attributes(p: &Path, attrs: u32) -> io::Result<()> {
+    let wide = to_long_path(p);
+    // Zero is not a valid request; the API spells "no attributes" this way.
+    let attrs = if attrs == 0 {
+        FILE_ATTRIBUTE_NORMAL
+    } else {
+        FILE_FLAGS_AND_ATTRIBUTES(attrs)
+    };
+    unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), attrs) }.map_err(io::Error::from)
+}
+
+/// `CreateHardLinkW`: a second name for the file at `existing`.
+pub(crate) fn create_hard_link(link: &Path, existing: &Path) -> io::Result<()> {
+    let (link, existing) = (to_long_path(link), to_long_path(existing));
+    unsafe { CreateHardLinkW(PCWSTR(link.as_ptr()), PCWSTR(existing.as_ptr()), None) }
+        .map_err(io::Error::from)
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, so it never overwrites.
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (to_long_path(from), to_long_path(to));
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(io::Error::from)
+}
+
+fn open_for_delete(p: &Path) -> io::Result<HANDLE> {
+    let wide = to_long_path(p);
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            DELETE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(io::Error::from)
+}
+
+/// Removes one name of a file. The read-only attribute belongs to the file and not
+/// to the name, so it is ignored rather than cleared: any other name of the file
+/// keeps it.
+pub(crate) fn delete_name(p: &Path) -> io::Result<()> {
+    let handle = open_for_delete(p)?;
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
+            FILE_DISPOSITION_FLAG_DELETE.0
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0
+                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE.0,
+        ),
+    };
+    let result = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            &info as *const _ as *const c_void,
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    // Not every file system takes those flags. A plain delete only falls short on
+    // a read-only file.
+    result
+        .or_else(|_| unsafe { DeleteFileW(PCWSTR(to_long_path(p).as_ptr())) })
+        .map_err(io::Error::from)
+}
+
+/// Whether another handle stops this file from being deleted right now.
+pub(crate) fn is_locked_against_delete(p: &Path) -> bool {
+    match open_for_delete(p) {
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            false
+        }
+        Err(e) => e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.to_hresult().0),
+    }
+}
+
+/// The `{guid}` of the volume holding `p`. `None` where there is no such thing to
+/// ask about, such as a network share.
+pub(crate) fn volume_guid(p: &Path) -> Option<String> {
+    let wide = to_long_path(p);
+    let mut root = vec![0u16; 1024];
+    unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut root) }.ok()?;
+    let mut name = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(root.as_ptr()), &mut name) }.ok()?;
+    let len = name.iter().position(|&c| c == 0)?;
+    let name = String::from_utf16(&name[..len]).ok()?;
+    let start = name.find('{')?;
+    let end = name.find('}')?;
+    Some(name.get(start..=end)?.to_string())
+}
+
+/// Length of the file's content, sparse or not. Asks the file rather than the
+/// directory, whose copy can be stale when a file has several hard links. Does not
+/// recall anything from the cloud.
+pub(crate) fn logical_len(p: &Path) -> io::Result<u64> {
+    let info = file_info(p)?;
+    Ok((u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow))
+}
+
 /// Size on disk as reported by `GetCompressedFileSizeW`: the compressed size for
 /// compressed or sparse files, the plain length otherwise.
 pub fn allocated_size(p: &Path) -> io::Result<u64> {
@@ -211,9 +391,9 @@ pub fn allocated_size(p: &Path) -> io::Result<u64> {
     Ok((u64::from(high) << 32) | u64::from(low))
 }
 
-/// `(volume serial, file id, link count)`. Opens with `FILE_READ_ATTRIBUTES`
-/// only and without following reparse points, so nothing is recalled from the cloud.
-pub fn link_info(p: &Path) -> io::Result<(u64, u64, u32)> {
+/// Opens with `FILE_READ_ATTRIBUTES` only and without following reparse points, so
+/// nothing is recalled from the cloud.
+fn file_info(p: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let wide = to_long_path(p);
     let handle = unsafe {
         CreateFileW(
@@ -230,7 +410,12 @@ pub fn link_info(p: &Path) -> io::Result<(u64, u64, u32)> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let result = unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(io::Error::from);
     let _ = unsafe { CloseHandle(handle) };
-    result?;
+    result.map(|()| info)
+}
+
+/// `(volume serial, file id, link count)`, by way of [`file_info`].
+pub fn link_info(p: &Path) -> io::Result<(u64, u64, u32)> {
+    let info = file_info(p)?;
     let id = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Ok((
         u64::from(info.dwVolumeSerialNumber),

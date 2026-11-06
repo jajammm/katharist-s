@@ -196,6 +196,7 @@ dependencies = [
  "rayon",
  "tempfile",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
