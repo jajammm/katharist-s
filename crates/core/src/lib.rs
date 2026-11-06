@@ -1,4 +1,6 @@
+pub mod analysis;
 pub mod delete;
+pub mod dupes;
 pub mod format;
 pub mod junk;
 pub mod other_space;
