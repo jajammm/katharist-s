@@ -1,0 +1,14 @@
+   -     
+Name                                  Id                                                                        Version       Available     Source
+--------------------------------------------------------------------------------------------------------------------------------------------------
+Mozilla Firefox (x64 en-US)           Mozilla.Firefox                                                           126.0         127.0         winget
+Git                                   Git.Git                                                                   2.45.1        2.45.2        winget
+示例文本编辑器                        Example.TextEditorCN                                                      2.0.1         2.0.2         winget
+Dokumen Contoh Aplikasi Panjang Sek…  Example.LongNamedApp                                                      5.4.3         5.5.0         winget
+4 upgrades available.
+
+The following packages have an upgrade available, but require explicit targeting for upgrade:
+Name                                  Id                                                                        Version       Available     Source
+--------------------------------------------------------------------------------------------------------------------------------------------------
+Sample Pinned Tool                    Example.PinnedTool                                                        1.0           1.1           winget
+1 package(s) have pins that prevent upgrade.

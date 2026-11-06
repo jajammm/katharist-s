@@ -1,0 +1,15 @@
+Name                                  Id                                                                        Version       Available     Source
+--------------------------------------------------------------------------------------------------------------------------------------------------
+Mozilla Firefox (x64 en-US)           Mozilla.Firefox                                                           126.0         127.0         winget
+7-Zip                                 7zip.7zip                                                                 23.01                       winget
+Git                                   Git.Git                                                                   2.45.1        2.45.2        winget
+Notepad++ (64-bit x64)                Notepad++.Notepad++                                                       8.6.7                       winget
+Python 3.12.3 Core Interpreter Libr…  ARP\Machine\X64\{11111111-2222-3333-4444-555555555555}                    3.12.3150.0                 
+Sample Legacy Tool                    ARP\User\X64\SampleLegacyTool                                             1.0                         
+Microsoft Visual C++ 2015-2022 Redi…  Microsoft.VCRedist.2015+.x64                                              14.38.33135                 winget
+Microsoft.UI.Xaml.2.8                 MSIX\Microsoft.UI.Xaml.2.8_8.2310.30001.0_x64__8wekyb3d8bbwe              8.2310.3000…                
+Microsoft Visual C++ v14 Desktop Fr…  MSIX\Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64__8wekyb3d8bbwe   14.0.33728.0                
+Sample Photo Viewer                   MSIX\Contoso.PhotoViewer_1.2.3.0_x64__abcdefghjk                          1.2.3.0                     
+示例文本编辑器                        Example.TextEditorCN                                                      2.0.1         2.0.2         winget
+Dokumen Contoh Aplikasi Panjang Sek…  Example.LongNamedApp                                                      5.4.3                       winget
+Windows 10 Update Assistant           ARP\Machine\X86\Sample_is1                                                1.4                         

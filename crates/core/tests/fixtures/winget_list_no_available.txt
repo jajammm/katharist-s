@@ -1,0 +1,5 @@
+Name                                  Id                                                                        Version       Source
+------------------------------------------------------------------------------------------------------------------------------------
+VLC media player                      VideoLAN.VLC                                                              3.0.20        winget
+Sample Legacy Tool                    ARP\User\X64\SampleLegacyTool                                             1.0           
+Microsoft.NET.Runtime.8               MSIX\Microsoft.NET.Native.Runtime.2.2_2.2.28604.0_x64__8wekyb3d8bbwe      2.2.28604.0   
