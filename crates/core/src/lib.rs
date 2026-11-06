@@ -1,5 +1,6 @@
 pub mod delete;
 pub mod format;
+pub mod junk;
 pub mod other_space;
 pub mod protect;
 pub mod recycle;
