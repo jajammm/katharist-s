@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::analysis::reachable_files;
-use crate::scan::{EntryClass, ScanProgress, ScanTree};
+use crate::scan::{is_cloud_only, EntryClass, ScanProgress, ScanTree};
 use crate::win;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,10 +133,28 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Re-reads the disk right before deleting `selected`. True only if `keep`
+/// The file attributes of `p` itself, read from its directory entry and not from
+/// its content, so asking never recalls a cloud file.
+fn attrs_of(p: &Path) -> Option<u32> {
+    win::entry_info(p).ok().map(|e| e.attrs)
+}
+
+/// A file may be read only when its attributes are known and it is not cloud-only.
+/// Reading a cloud-only file would download it.
+fn may_read(attrs: Option<u32>) -> bool {
+    attrs.is_some_and(|a| !is_cloud_only(a))
+}
+
+/// Re-reads the disk right before deleting `selected`. A keeper or selected file
+/// that is now cloud-only fails without being read. Otherwise true only if `keep`
 /// still exists with the group's length, is not itself selected (by path or
 /// as the same file), and every selected file is still byte-identical to it.
 pub fn targets_still_safe(group: &DuplicateGroup, selected: &[PathBuf]) -> bool {
+    // Before any byte is read: a file that went cloud-only since the scan is not
+    // safe, and checking it must not download it.
+    if !may_read(attrs_of(&group.keep)) || !selected.iter().all(|s| may_read(attrs_of(s))) {
+        return false;
+    }
     if logical_len(&group.keep) != Some(group.size) {
         return false;
     }
@@ -361,6 +379,23 @@ mod tests {
         let tree = do_scan(d.path());
         let g = &find_duplicates(&tree, 1, &ScanProgress::default())[0];
         assert!(!targets_still_safe(g, &[alias]));
+    }
+
+    #[test]
+    fn cloud_only_or_unknown_attributes_are_never_read() {
+        assert!(may_read(Some(0x20)));
+        assert!(!may_read(Some(0x40_0000)));
+        assert!(!may_read(Some(0x4_0000)));
+        assert!(!may_read(Some(0x1000)));
+        assert!(!may_read(None));
+    }
+
+    #[test]
+    fn local_files_pass_the_attribute_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let a = write(d.path(), "a", &[4; 3000]);
+        assert!(may_read(attrs_of(&a)));
+        assert!(!may_read(attrs_of(&d.path().join("missing"))));
     }
 
     #[test]
