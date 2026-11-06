@@ -171,6 +171,11 @@ fn add_children(
 
 /// The folder `dir` itself as one item, named `label`.
 fn add_folder(found: &mut Found, dir: &Path, label: String, progress: &ScanProgress) {
+    if let Ok(e) = win::entry_info(dir) {
+        if scan::classify(e.attrs, e.reparse_tag) == EntryClass::Link {
+            return;
+        }
+    }
     match scan_folder(dir, progress) {
         Ok(None) => {}
         Err(_) => found.unreadable = true,
@@ -605,6 +610,7 @@ mod tests {
             .items
             .iter()
             .all(|i| !i.path.starts_with(data.join("Linked"))));
+        assert!(c.items.iter().all(|i| i.path != data.join(r"Real\Cache")));
     }
 
     #[test]
