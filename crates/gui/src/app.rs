@@ -11,7 +11,10 @@ use crate::confirm::{self, ConfirmContext, ConfirmRequest, DeleteFlow};
 use crate::i18n::{self, l};
 use crate::jobs::Job;
 use crate::views::clean::{self, CleanState};
+use crate::views::dupes::{self, DupesState};
 use crate::views::home::{self, HomeAction, HomeState};
+use crate::views::large::{self, LargeState};
+use crate::views::stale::{self, StaleState};
 use crate::{theme, views};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +45,9 @@ pub struct App {
     /// The context of the request that started `flow`, which the report depends on.
     flow_context: ConfirmContext,
     clean: CleanState,
+    large: LargeState,
+    stale: StaleState,
+    dupes: DupesState,
     /// A close was refused and the job it waited for is still running.
     close_refused: bool,
 }
@@ -66,6 +72,9 @@ impl App {
             flow: DeleteFlow::Idle,
             flow_context: ConfirmContext::User,
             clean: CleanState::default(),
+            large: LargeState::default(),
+            stale: StaleState::default(),
+            dupes: DupesState::default(),
             close_refused: false,
         };
         app.apply_language();
@@ -106,6 +115,7 @@ impl App {
             if let Some(tree) = &mut self.tree {
                 self.home.after_report(tree, &report);
             }
+            self.dupes.after_report(&report);
         }
         if self.flow.outcome_unknown() {
             self.home.mark_stale();
@@ -274,11 +284,44 @@ impl eframe::App for App {
                         }
                     }
                     Tool::Apps => Self::placeholder(ui, l("Apps", "Aplikasi")),
-                    Tool::Large => Self::placeholder(ui, l("Largest", "Terbesar")),
-                    Tool::Stale => {
-                        Self::placeholder(ui, l("Not changed in a while", "Lama Tak Diubah"))
+                    Tool::Large => {
+                        let action = large::show(
+                            ui,
+                            &mut self.large,
+                            self.tree.as_ref(),
+                            &self.home,
+                            &self.protect,
+                        );
+                        if let Some(action) = action {
+                            self.handle_home(&ctx, action);
+                        }
                     }
-                    Tool::Dupes => Self::placeholder(ui, l("Duplicates", "Duplikat")),
+                    Tool::Stale => {
+                        let action = stale::show(
+                            ui,
+                            &mut self.stale,
+                            self.tree.as_ref(),
+                            &self.home,
+                            &self.protect,
+                        );
+                        if let Some(action) = action {
+                            self.handle_home(&ctx, action);
+                        }
+                    }
+                    Tool::Dupes => {
+                        let busy = !self.flow.is_idle();
+                        let action = dupes::show(
+                            ui,
+                            &mut self.dupes,
+                            self.tree.as_ref(),
+                            &self.home,
+                            &self.protect,
+                            busy,
+                        );
+                        if let Some(action) = action {
+                            self.handle_home(&ctx, action);
+                        }
+                    }
                     Tool::Settings => {
                         if views::settings::show(ui, &mut self.settings, &mut self.new_excluded) {
                             self.save();

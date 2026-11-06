@@ -24,14 +24,13 @@ pub struct ConfirmRequest {
     pub empty_bin: Option<u64>,
 }
 
-/// `Leftovers` and `Duplicates` are raised by the screens of tasks 15 and 16.
+// `Leftovers` is raised by the screen of task 16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfirmContext {
     User,
     Cleanup,
     #[allow(dead_code)]
     Leftovers,
-    #[allow(dead_code)]
     Duplicates,
 }
 

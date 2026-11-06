@@ -31,7 +31,7 @@ use crate::theme::{self, TilePalette};
 const MIN_TILE_FRACTION: f32 = 0.005;
 const MAX_TILES: usize = 40;
 /// `is_protected` makes file system calls, so a frame computes only this many rows.
-const FLAG_ROWS_PER_FRAME: usize = 6;
+pub(crate) const FLAG_ROWS_PER_FRAME: usize = 6;
 const SECONDS_PER_DAY: u64 = 86_400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,11 +396,11 @@ pub fn browser_profile_roots(local: Option<&Path>, roaming: Option<&Path>) -> Ve
     roots
 }
 
-fn cloud_mark() -> &'static str {
+pub(crate) fn cloud_mark() -> &'static str {
     l("in the cloud", "di cloud")
 }
 
-fn app_mark() -> &'static str {
+pub(crate) fn app_mark() -> &'static str {
     l("used by an app", "dipakai aplikasi")
 }
 
@@ -559,6 +559,11 @@ pub struct HomeState {
     other: OtherLoad,
     map_stale: bool,
     locks: Locks,
+    /// Counts every change of the tree: a scan, a delete, a stale flag. Screens that
+    /// keep ticks or lists made from the tree compare it to know they are out of date.
+    generation: u64,
+    /// Counts only new trees, which make anything derived from the old one meaningless.
+    epoch: u64,
 }
 
 impl HomeState {
@@ -590,6 +595,8 @@ impl HomeState {
             other: OtherLoad::Idle,
             map_stale: false,
             locks: Locks::default(),
+            generation: 0,
+            epoch: 0,
         };
         state.refresh_space(ctx);
         state
@@ -612,6 +619,7 @@ impl HomeState {
     ) {
         *tree = None;
         self.scan_error = None;
+        self.new_tree();
         self.reset_view();
         self.location = 0;
         self.map_stale = false;
@@ -624,6 +632,50 @@ impl HomeState {
             scan(&root, &scan_options(excluded), &seen)
         });
         self.scan = Some(RunningScan { job, progress });
+    }
+
+    fn new_tree(&mut self) {
+        self.generation += 1;
+        self.epoch += 1;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn map_stale(&self) -> bool {
+        self.map_stale
+    }
+
+    pub fn locks(&self) -> &Locks {
+        &self.locks
+    }
+
+    /// `None` until the installed-app list is in; rows get no checkbox before then.
+    pub fn marks(&self) -> Option<&UsageMarks> {
+        self.marks.as_ref()
+    }
+
+    pub fn marks_failed(&self) -> bool {
+        self.marks_failed
+    }
+
+    pub fn scan_progress(&self) -> Option<&ScanProgress> {
+        self.scan.as_ref().map(|s| &s.progress)
+    }
+
+    pub fn scan_error(&self) -> Option<&str> {
+        self.scan_error.as_deref()
+    }
+
+    /// The location Home would scan now: its folder field if that holds a path,
+    /// otherwise its drive.
+    pub fn selected_location(&self) -> PathBuf {
+        scan_target(&self.drive, &self.folder_text).unwrap_or_else(|_| PathBuf::from(&self.drive))
     }
 
     fn reset_view(&mut self) {
@@ -668,6 +720,7 @@ impl HomeState {
                 Ok(Ok(new_tree)) => {
                     self.location = new_tree.root;
                     self.reset_view();
+                    self.new_tree();
                     *tree = Some(new_tree);
                     self.refresh_space(ctx);
                 }
@@ -687,6 +740,7 @@ impl HomeState {
 
     /// Brings the screen in line with a finished delete.
     pub fn after_report(&mut self, tree: &mut ScanTree, report: &DeleteReport) {
+        self.generation += 1;
         apply_report(tree, report);
         self.locks.add_report(tree, report);
         let location = location_or_root(tree, self.location);
@@ -722,6 +776,7 @@ impl HomeState {
     /// A delete ended with an unknown outcome, so the map may be wrong and what is
     /// ticked may be gone already. Sizes from here on would count space twice.
     pub fn mark_stale(&mut self) {
+        self.generation += 1;
         self.map_stale = true;
         self.selection.clear();
     }
@@ -875,7 +930,13 @@ fn legend(ui: &mut egui::Ui) {
     });
 }
 
-fn cell(ui: &mut egui::Ui, width: f32, height: f32, right: bool, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    right: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     let layout = if right {
         Layout::right_to_left(Align::Center)
     } else {
@@ -888,7 +949,7 @@ fn cell(ui: &mut egui::Ui, width: f32, height: f32, right: bool, add: impl FnOnc
     });
 }
 
-fn row_marks(node: &Node, flags: Option<&RowFlags>) -> String {
+pub(crate) fn row_marks(node: &Node, flags: Option<&RowFlags>) -> String {
     let mut marks = Vec::new();
     if flags.is_some_and(|f| f.protected) {
         marks.push(l("protected", "dilindungi"));
@@ -914,12 +975,12 @@ fn row_marks(node: &Node, flags: Option<&RowFlags>) -> String {
     marks.join(", ")
 }
 
-const CHECK_WIDTH: f32 = 24.0;
-const SIZE_WIDTH: f32 = 80.0;
-const DATE_WIDTH: f32 = 84.0;
-const MARK_WIDTH: f32 = 150.0;
+pub(crate) const CHECK_WIDTH: f32 = 24.0;
+pub(crate) const SIZE_WIDTH: f32 = 80.0;
+pub(crate) const DATE_WIDTH: f32 = 84.0;
+pub(crate) const MARK_WIDTH: f32 = 150.0;
 
-fn name_width(ui: &egui::Ui) -> f32 {
+pub(crate) fn name_width(ui: &egui::Ui) -> f32 {
     let fixed = CHECK_WIDTH + SIZE_WIDTH + DATE_WIDTH + MARK_WIDTH;
     (ui.available_width() - fixed - 4.0 * ui.spacing().item_spacing.x - 16.0).max(60.0)
 }
@@ -1103,12 +1164,12 @@ fn draw_other_space(ui: &mut egui::Ui, other: &OtherLoad, cancelled: bool) {
 
 /// Whether a delete may be asked for. Not on a stale map: its sizes are what a report
 /// counts as freed, and after a partial delete they would count the same space again.
-fn can_delete(selection: &BTreeSet<NodeId>, marks_ready: bool, map_stale: bool) -> bool {
+pub(crate) fn can_delete(selection: &BTreeSet<NodeId>, marks_ready: bool, map_stale: bool) -> bool {
     !selection.is_empty() && marks_ready && !map_stale
 }
 
 /// What a press of a delete button asks for, if it may ask for anything.
-fn delete_action(
+pub(crate) fn delete_action(
     tree: &ScanTree,
     flags: &HashMap<NodeId, RowFlags>,
     selection: &BTreeSet<NodeId>,
@@ -1129,10 +1190,10 @@ fn offers_gap_panel(tree: &ScanTree) -> bool {
 
 /// The buttons that lead into a delete. Both only open the confirmation, and
 /// permanent is a separate button of its own, never a remembered setting.
-fn action_bar(
+pub(crate) fn action_bar(
     ui: &mut egui::Ui,
     tree: &ScanTree,
-    view: &LocationView,
+    flags: &HashMap<NodeId, RowFlags>,
     selection: &BTreeSet<NodeId>,
     marks_ready: bool,
     map_stale: bool,
@@ -1166,7 +1227,7 @@ fn action_bar(
             format_size(total)
         ));
     });
-    delete_action(tree, &view.flags, selection, mode, can_delete)
+    delete_action(tree, flags, selection, mode, can_delete)
 }
 
 /// Everything below the controls, once there is a tree.
@@ -1299,7 +1360,7 @@ fn body(
             action = action.or(action_bar(
                 ui,
                 tree,
-                &view,
+                &view.flags,
                 &st.selection,
                 marks.is_some(),
                 st.map_stale,

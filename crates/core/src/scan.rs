@@ -51,7 +51,7 @@ pub fn is_cloud_only(attrs: u32) -> bool {
 
 pub type NodeId = usize;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Node {
     pub name: String,
     pub size: u64,
@@ -62,13 +62,13 @@ pub struct Node {
     pub children: Vec<NodeId>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScanError {
     pub path: PathBuf,
     pub reason: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScanTree {
     pub nodes: Vec<Node>,
     pub root: NodeId,
