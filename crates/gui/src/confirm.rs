@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use katharistis_core::delete::{self, DeleteMode, DeleteReport, FailReason, Target};
 use katharistis_core::format::format_size;
@@ -206,12 +206,32 @@ pub fn close_refused_text() -> &'static str {
     )
 }
 
-/// Failures after which what the map shows may no longer match the disk. A
-/// protected or not-recyclable item was not touched at all.
+/// Failures after which nothing on the map can be trusted: a guard is about a file
+/// that may be missing from where the map says it is. A panic gets here too, through
+/// `DeleteFlow::outcome_unknown`.
 pub fn map_may_be_stale(r: &DeleteReport) -> bool {
     r.failed
         .iter()
-        .any(|f| !matches!(f.reason, FailReason::Protected | FailReason::NotRecyclable))
+        .any(|f| matches!(f.reason, FailReason::GuardKept(_)))
+}
+
+/// Paths whose size on the map may be wrong after this report, since the delete may
+/// have taken part of them. The rest of the map stays true. A protected or
+/// not-recyclable item was not touched at all.
+pub fn failed_to_lock(r: &DeleteReport) -> Vec<&Path> {
+    r.failed
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.reason,
+                FailReason::InUse
+                    | FailReason::AccessDenied
+                    | FailReason::NotFound
+                    | FailReason::Other(_)
+            )
+        })
+        .map(|f| f.path.as_path())
+        .collect()
 }
 
 fn mode_text(mode: DeleteMode) -> &'static str {
@@ -292,8 +312,8 @@ pub fn reason_text(reason: &FailReason) -> String {
         FailReason::GuardKept(guard) => format!(
             "{} {}",
             l(
-                "Not confirmed back under its name. Its data may be only at:",
-                "Tidak terkonfirmasi kembali dengan namanya. Datanya mungkin hanya ada di:",
+                "Kept. A file's data may be only at:",
+                "Dibiarkan. Data sebuah file mungkin hanya ada di:",
             ),
             guard.display()
         ),
@@ -350,8 +370,8 @@ pub fn unknown_outcome_text() -> &'static str {
 
 fn offer_text() -> &'static str {
     l(
-        "These items cannot go to the Recycle Bin. A link inside a folder, a size above the bin's limit, or this drive's Recycle Bin settings can each be the reason. Delete permanently? Tick the ones you want gone.",
-        "File ini tidak bisa masuk Recycle Bin. Penyebabnya bisa tautan di dalam folder, ukuran di atas batas Recycle Bin, atau pengaturan Recycle Bin drive ini. Hapus permanen? Centang yang ingin dihapus.",
+        "These items cannot go to the Recycle Bin. A link or a guard file inside a folder, a size above the bin's limit, or this drive's Recycle Bin settings can each be the reason. Delete permanently? A guard file stays either way. Tick the ones you want gone.",
+        "File ini tidak bisa masuk Recycle Bin. Penyebabnya bisa tautan atau file pengaman di dalam folder, ukuran di atas batas Recycle Bin, atau pengaturan Recycle Bin drive ini. Hapus permanen? File pengaman tetap dibiarkan. Centang yang ingin dihapus.",
     )
 }
 
@@ -846,7 +866,6 @@ pub fn show_flow(
 mod tests {
     use super::*;
     use katharistis_core::delete::Failed;
-    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1036,26 +1055,49 @@ mod tests {
     }
 
     #[test]
-    fn map_staleness_ignores_items_that_were_not_touched() {
-        let untouched = DeleteReport {
+    fn only_a_guard_makes_the_whole_map_stale() {
+        let report = |reason| DeleteReport {
+            failed: vec![fail(r"C:\a", 1, reason)],
+            ..Default::default()
+        };
+        assert!(map_may_be_stale(&report(FailReason::GuardKept(
+            r"C:\g".into()
+        ))));
+        for reason in [
+            FailReason::Protected,
+            FailReason::NotRecyclable,
+            FailReason::InUse,
+            FailReason::AccessDenied,
+            FailReason::NotFound,
+            FailReason::Other("x".into()),
+        ] {
+            assert!(!map_may_be_stale(&report(reason)));
+        }
+    }
+
+    #[test]
+    fn ordinary_failures_are_locked_and_untouched_items_are_not() {
+        let r = DeleteReport {
             failed: vec![
-                fail(r"C:\a", 1, FailReason::Protected),
-                fail(r"C:\b", 1, FailReason::NotRecyclable),
+                fail(r"C:\use", 1, FailReason::InUse),
+                fail(r"C:\deny", 1, FailReason::AccessDenied),
+                fail(r"C:\gone", 1, FailReason::NotFound),
+                fail(r"C:\other", 1, FailReason::Other("x".into())),
+                fail(r"C:\prot", 1, FailReason::Protected),
+                fail(r"C:\nobin", 1, FailReason::NotRecyclable),
+                fail(r"C:\guard", 1, FailReason::GuardKept(r"C:\g".into())),
             ],
             ..Default::default()
         };
-        assert!(!map_may_be_stale(&untouched));
-        for reason in [
-            FailReason::GuardKept(r"C:\g".into()),
-            FailReason::InUse,
-            FailReason::NotFound,
-        ] {
-            let touched = DeleteReport {
-                failed: vec![fail(r"C:\a", 1, reason)],
-                ..Default::default()
-            };
-            assert!(map_may_be_stale(&touched));
-        }
+        assert_eq!(
+            failed_to_lock(&r),
+            [
+                Path::new(r"C:\use"),
+                Path::new(r"C:\deny"),
+                Path::new(r"C:\gone"),
+                Path::new(r"C:\other"),
+            ]
+        );
     }
 
     #[test]

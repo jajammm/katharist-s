@@ -408,9 +408,10 @@ fn recycle_folder_with_settings(
     }
 }
 
-/// The logical length of everything under `root`, or `None` if a link is in there
-/// at any depth. Links are not entered and no file's data is opened, so nothing is
-/// recalled from the cloud.
+/// The logical length of everything under `root`, or `None` if a link or a guard is
+/// in there at any depth: the bin would take the guard along, and restoring from it
+/// is not something to promise. Links are not entered and no file's data is opened,
+/// so nothing is recalled from the cloud.
 fn folder_logical_len(root: &Path) -> io::Result<Option<u64>> {
     let mut total = 0u64;
     let mut folders = vec![root.to_path_buf()];
@@ -420,6 +421,7 @@ fn folder_logical_len(root: &Path) -> io::Result<Option<u64>> {
             match classify(entry.attrs, entry.reparse_tag) {
                 EntryClass::Link => return Ok(None),
                 EntryClass::Dir => folders.push(path),
+                EntryClass::File if is_guard_name(&entry.name) => return Ok(None),
                 EntryClass::File => total = total.saturating_add(win::logical_len(&path)?),
             }
         }
@@ -665,6 +667,20 @@ mod tests {
         assert!(!is_guard_name("katharistis-guard-123-0"));
         assert!(!is_guard_name(".katharistis-guardian"));
         assert!(!is_guard_name("notes.txt"));
+    }
+
+    #[test]
+    fn a_guard_at_any_depth_makes_a_folder_unmeasurable_for_the_bin() {
+        let dir = Builder::new()
+            .prefix("katharistis-test-")
+            .tempdir()
+            .unwrap();
+        let deep = dir.path().join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("f"), [1u8; 10]).unwrap();
+        assert_eq!(folder_logical_len(dir.path()).unwrap(), Some(10));
+        fs::write(deep.join(".katharistis-guard-1-0"), [1u8; 10]).unwrap();
+        assert_eq!(folder_logical_len(dir.path()).unwrap(), None);
     }
 
     fn guarded_file() -> (TempDir, PathBuf, Guard) {

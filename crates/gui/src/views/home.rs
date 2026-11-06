@@ -22,7 +22,7 @@ use katharistis_core::treemap::{map_items, squarify, MapItem, Rect};
 use katharistis_core::win;
 use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
-use crate::confirm::{map_may_be_stale, ConfirmContext, ConfirmRequest};
+use crate::confirm::{failed_to_lock, map_may_be_stale, ConfirmContext, ConfirmRequest};
 use crate::i18n::l;
 use crate::jobs::{Job, JobPanicked};
 use crate::theme::{self, TilePalette};
@@ -231,11 +231,54 @@ pub struct RowFlags {
     pub app_owned: bool,
     /// A guard left by a recycle that went wrong; its data may be only here.
     pub guard: bool,
+    /// A delete failed in or under this row, so its size may be wrong until a rescan.
+    pub locked: bool,
 }
 
-/// A row gets a checkbox once it is known to be neither protected nor a guard file.
+/// A row gets a checkbox once it is known to be neither protected, a guard file nor
+/// locked.
 pub fn can_select(flags: Option<&RowFlags>) -> bool {
-    flags.is_some_and(|f| !f.protected && !f.guard)
+    flags.is_some_and(|f| !f.protected && !f.guard && !f.locked)
+}
+
+/// What a failed delete leaves unsafe to delete again before a rescan. A partial
+/// delete makes the sizes of the failed path wrong, of everything inside it, and of
+/// every folder above it, and those sizes are what a report counts as freed. Rows
+/// elsewhere keep their true size. Node ids stay valid until the next scan.
+#[derive(Debug, Default)]
+pub struct Locks {
+    failed: BTreeSet<NodeId>,
+    above_failed: BTreeSet<NodeId>,
+}
+
+impl Locks {
+    pub fn add_report(&mut self, tree: &ScanTree, report: &DeleteReport) {
+        for id in failed_to_lock(report)
+            .into_iter()
+            .filter_map(|path| find_node(tree, path))
+        {
+            self.failed.insert(id);
+            let mut up = tree.nodes[id].parent;
+            while let Some(parent) = up {
+                self.above_failed.insert(parent);
+                up = tree.nodes[parent].parent;
+            }
+        }
+    }
+
+    pub fn is_locked(&self, tree: &ScanTree, id: NodeId) -> bool {
+        if self.above_failed.contains(&id) {
+            return true;
+        }
+        let mut cur = Some(id);
+        while let Some(node) = cur {
+            if self.failed.contains(&node) {
+                return true;
+            }
+            cur = tree.nodes[node].parent;
+        }
+        false
+    }
 }
 
 /// The confirmation for what is ticked. Anything that could not have a checkbox
@@ -398,6 +441,7 @@ pub fn compute_flags(p: &Path, protect: &ProtectContext, marks: &UsageMarks) -> 
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(is_guard_name),
+        locked: false,
     }
 }
 
@@ -450,6 +494,9 @@ struct LocationView {
     tiles: Vec<Tile>,
     rows: Vec<NodeId>,
     flags: HashMap<NodeId, RowFlags>,
+    /// The tree changed under this location, so tiles and rows need building again.
+    /// Flags stay, because they are what lets what is still ticked reach a request.
+    dirty: bool,
 }
 
 impl LocationView {
@@ -468,6 +515,7 @@ impl LocationView {
             tiles,
             rows: tree.children_by_size(id),
             flags: HashMap::new(),
+            dirty: false,
         }
     }
 
@@ -477,11 +525,12 @@ impl LocationView {
         id: NodeId,
         protect: &ProtectContext,
         marks: &UsageMarks,
+        locks: &Locks,
     ) -> RowFlags {
-        *self
-            .flags
-            .entry(id)
-            .or_insert_with(|| compute_flags(&tree.path_of(id), protect, marks))
+        *self.flags.entry(id).or_insert_with(|| RowFlags {
+            locked: locks.is_locked(tree, id),
+            ..compute_flags(&tree.path_of(id), protect, marks)
+        })
     }
 }
 
@@ -508,6 +557,7 @@ pub struct HomeState {
     pane: Pane,
     other: OtherLoad,
     map_stale: bool,
+    locks: Locks,
 }
 
 impl HomeState {
@@ -538,6 +588,7 @@ impl HomeState {
             pane: Pane::Map,
             other: OtherLoad::Idle,
             map_stale: false,
+            locks: Locks::default(),
         };
         state.refresh_space(ctx);
         state
@@ -563,6 +614,7 @@ impl HomeState {
         self.reset_view();
         self.location = 0;
         self.map_stale = false;
+        self.locks = Locks::default();
         self.space_root = root.clone();
         self.refresh_space(ctx);
         let progress = ScanProgress::default();
@@ -635,9 +687,35 @@ impl HomeState {
     /// Brings the screen in line with a finished delete.
     pub fn after_report(&mut self, tree: &mut ScanTree, report: &DeleteReport) {
         apply_report(tree, report);
+        self.locks.add_report(tree, report);
         let location = location_or_root(tree, self.location);
-        self.go_to(location);
-        self.map_stale |= map_may_be_stale(report);
+        if location == self.location {
+            self.refresh_location(tree);
+        } else {
+            self.go_to(location);
+        }
+        if map_may_be_stale(report) {
+            self.mark_stale();
+        }
+    }
+
+    /// The location is still there but the tree changed. What left or is now locked
+    /// comes off the selection; every other tick stays.
+    fn refresh_location(&mut self, tree: &ScanTree) {
+        let locks = &self.locks;
+        let usable = |id: NodeId| location_or_root(tree, id) == id && !locks.is_locked(tree, id);
+        self.selection.retain(|&id| usable(id));
+        if let Some(view) = &mut self.view {
+            view.dirty = true;
+            view.flags.retain(|&id, _| location_or_root(tree, id) == id);
+            for (&id, flags) in &mut view.flags {
+                flags.locked = locks.is_locked(tree, id);
+            }
+        }
+        if self.pane == Pane::OtherSpace {
+            self.pane = Pane::Map;
+        }
+        self.other = OtherLoad::Idle;
     }
 
     /// A delete ended with an unknown outcome, so the map may be wrong and what is
@@ -705,6 +783,7 @@ fn draw_map(
     view: &mut LocationView,
     marks: Option<&UsageMarks>,
     protect: &ProtectContext,
+    locks: &Locks,
     height: f32,
 ) -> Option<TileAction> {
     let (resp, painter) =
@@ -745,8 +824,8 @@ fn draw_map(
             let lines = match item.node {
                 Some(id) => {
                     let node = &tree.nodes[id];
-                    let owned =
-                        marks.is_some_and(|m| view.flags_for(tree, id, protect, m).app_owned);
+                    let owned = marks
+                        .is_some_and(|m| view.flags_for(tree, id, protect, m, locks).app_owned);
                     hover_lines(
                         &tree.path_of(id).display().to_string(),
                         node.size,
@@ -813,6 +892,9 @@ fn row_marks(node: &Node, flags: Option<&RowFlags>) -> String {
     if flags.is_some_and(|f| f.protected) {
         marks.push(l("protected", "dilindungi"));
     }
+    if flags.is_some_and(|f| f.locked) {
+        marks.push(l("scan again to change", "pindai ulang untuk mengubah"));
+    }
     if flags.is_some_and(|f| f.guard) {
         marks.push(l(
             "guard file, may hold a file's data",
@@ -852,6 +934,7 @@ fn draw_list(
     ticks_allowed: bool,
     marks: Option<&UsageMarks>,
     protect: &ProtectContext,
+    locks: &Locks,
     stale_days: u32,
     height: f32,
 ) -> Option<NodeId> {
@@ -886,7 +969,7 @@ fn draw_list(
                 if let Some(marks) = marks {
                     if !view.flags.contains_key(&id) && budget > 0 {
                         budget -= 1;
-                        view.flags_for(tree, id, protect, marks);
+                        view.flags_for(tree, id, protect, marks, locks);
                     }
                 }
                 let flags = view.flags.get(&id).copied();
@@ -1033,7 +1116,9 @@ fn delete_action(
 ) -> Option<HomeAction> {
     pressed
         .filter(|_| allowed)
-        .map(|mode| HomeAction::Delete(request_from_selection(tree, selection, flags, mode)))
+        .map(|mode| request_from_selection(tree, selection, flags, mode))
+        .filter(|request| !request.items.is_empty())
+        .map(HomeAction::Delete)
 }
 
 /// The panel that explains used against scanned is about a whole drive.
@@ -1149,6 +1234,15 @@ fn body(
         .view
         .take()
         .filter(|v| v.id == location)
+        .map(|old| {
+            if !old.dirty {
+                return old;
+            }
+            LocationView {
+                flags: old.flags,
+                ..LocationView::build(tree, location, protect)
+            }
+        })
         .unwrap_or_else(|| LocationView::build(tree, location, protect));
     let marks = st.marks.as_ref();
     let mut tile_action = None;
@@ -1181,7 +1275,7 @@ fn body(
                 ));
             } else {
                 let height = (ui.available_height() * 0.45).max(120.0);
-                tile_action = draw_map(ui, tree, &mut view, marks, protect, height);
+                tile_action = draw_map(ui, tree, &mut view, marks, protect, &st.locks, height);
                 legend(ui);
             }
             ui.add_space(4.0);
@@ -1195,6 +1289,7 @@ fn body(
                 !st.map_stale,
                 marks,
                 protect,
+                &st.locks,
                 stale_days,
                 height,
             );
@@ -1567,11 +1662,13 @@ mod tests {
             protected: true,
             app_owned: false,
             guard: false,
+            locked: false,
         })));
         assert!(can_select(Some(&RowFlags {
             protected: false,
             app_owned: true,
             guard: false,
+            locked: false,
         })));
     }
 
@@ -1582,16 +1679,19 @@ mod tests {
             protected: false,
             app_owned: false,
             guard: false,
+            locked: false,
         };
         let owned = RowFlags {
             protected: false,
             app_owned: true,
             guard: false,
+            locked: false,
         };
         let shielded = RowFlags {
             protected: true,
             app_owned: true,
             guard: false,
+            locked: false,
         };
         let flags = HashMap::from([(1, owned), (4, plain), (3, shielded)]);
         // 2 has no flags yet, 3 is protected: neither may reach the request.
@@ -1846,6 +1946,7 @@ mod tests {
             protected: false,
             app_owned: false,
             guard: false,
+            locked: false,
         };
         let flags = HashMap::from([(1, plain)]);
         let sel = BTreeSet::from([1]);
@@ -1891,18 +1992,167 @@ mod tests {
         let mut t = tree_at(r"C:\t");
         let mut st = state(&ctx_ui, &c);
         st.location = t.root;
+        // 100 of a's 120 went, and the true remainder is unknown to the map.
         let partial = DeleteReport {
-            failed: vec![Failed {
-                path: PathBuf::from(r"C:\t\a"),
-                size: 120,
-                reason: FailReason::InUse,
-            }],
+            failed: vec![in_use(r"C:\t\a", 120)],
             bytes_freed: 100,
             ..Default::default()
         };
         st.after_report(&mut t, &partial);
+        assert!(!st.map_stale);
+
+        // The folder, its contents, and the root above it: none can be asked for again.
+        for id in [t.root, 1, 2, 3] {
+            assert!(st.locks.is_locked(&t, id), "{id} is not locked");
+            let flags = HashMap::from([(id, row(&st.locks, &t, id))]);
+            assert!(!can_select(flags.get(&id)));
+            for mode in [DeleteMode::RecycleBin, DeleteMode::Permanent] {
+                let sel = BTreeSet::from([id]);
+                assert!(delete_action(&t, &flags, &sel, Some(mode), true).is_none());
+            }
+        }
+        // So nothing can add to the 100 already claimed from this folder.
+        let everything = BTreeSet::from([1, 2, 3]);
+        let flags: HashMap<_, _> = [1, 2, 3].map(|id| (id, row(&st.locks, &t, id))).into();
+        let req = request_from_selection(&t, &everything, &flags, DeleteMode::Permanent);
+        assert_eq!(req.items.iter().map(|i| i.size).sum::<u64>(), 0);
+    }
+
+    fn in_use(path: &str, size: u64) -> Failed {
+        Failed {
+            path: PathBuf::from(path),
+            size,
+            reason: FailReason::InUse,
+        }
+    }
+
+    fn row(locks: &Locks, t: &ScanTree, id: NodeId) -> RowFlags {
+        RowFlags {
+            protected: false,
+            app_owned: false,
+            guard: false,
+            locked: locks.is_locked(t, id),
+        }
+    }
+
+    #[test]
+    fn a_failure_locks_its_path_and_folders_above_and_leaves_the_rest() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let mut t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = 1;
+        let r = DeleteReport {
+            failed: vec![in_use(r"C:\t\a\x", 100)],
+            ..Default::default()
+        };
+        st.after_report(&mut t, &r);
+        assert!(!st.map_stale, "an ordinary failure leaves the map usable");
+
+        assert!(st.locks.is_locked(&t, 2), "the failed path");
+        assert!(st.locks.is_locked(&t, 1), "the folder above it");
+        assert!(!st.locks.is_locked(&t, 3), "a sibling");
+        assert!(!st.locks.is_locked(&t, 4), "a file elsewhere");
+
+        // The sibling still gets a checkbox and still leads to a delete.
+        let flags = HashMap::from([(3, row(&st.locks, &t, 3)), (2, row(&st.locks, &t, 2))]);
+        assert!(can_select(flags.get(&3)));
+        let sel = BTreeSet::from([3]);
+        let allowed = can_delete(&sel, true, st.map_stale);
+        let Some(HomeAction::Delete(req)) =
+            delete_action(&t, &flags, &sel, Some(DeleteMode::RecycleBin), allowed)
+        else {
+            panic!("expected a delete for the sibling");
+        };
+        assert_eq!(req.items.len(), 1);
+        assert_eq!(req.items[0].path, Path::new(r"C:\t\a\y"));
+
+        // Ticking the locked path yields nothing.
+        let locked = BTreeSet::from([2]);
+        let allowed = can_delete(&locked, true, st.map_stale);
+        assert!(delete_action(&t, &flags, &locked, Some(DeleteMode::Permanent), allowed).is_none());
+    }
+
+    #[test]
+    fn a_failure_keeps_other_ticks_and_drops_locked_and_gone_ones() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let mut t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = 1;
+        st.selection.extend([2, 3]);
+        let r = DeleteReport {
+            failed: vec![in_use(r"C:\t\a\x", 100)],
+            ..Default::default()
+        };
+        st.after_report(&mut t, &r);
+        assert_eq!(st.selection, BTreeSet::from([3]));
+
+        let gone = DeleteReport {
+            recycled: vec![PathBuf::from(r"C:\t\a\y")],
+            bytes_in_bin: 20,
+            ..Default::default()
+        };
+        st.after_report(&mut t, &gone);
+        assert!(st.selection.is_empty());
+        assert_eq!(st.location, 1);
+    }
+
+    #[test]
+    fn locks_reach_the_row_when_it_is_drawn_and_end_with_the_scan() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let mut t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = 1;
+        for _ in 0..2 {
+            run_frame(&ctx_ui, &mut |ui| {
+                show(ui, &mut st, Some(&t), 365, &c);
+            });
+        }
+        assert!(!st.view.as_ref().unwrap().flags[&2].locked);
+        let r = DeleteReport {
+            failed: vec![in_use(r"C:\t\a\x", 100)],
+            ..Default::default()
+        };
+        st.after_report(&mut t, &r);
+        for _ in 0..2 {
+            run_frame(&ctx_ui, &mut |ui| {
+                show(ui, &mut st, Some(&t), 365, &c);
+            });
+        }
+        let view = st.view.as_ref().unwrap();
+        assert!(view.flags[&2].locked);
+        assert!(!view.flags[&3].locked);
+        let n = node("x", 100, EntryClass::File, Some(1));
+        assert!(row_marks(&n, Some(&view.flags[&2])).contains("scan again"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut none = None;
+        st.start_scan(&ctx_ui, dir.path().to_path_buf(), Vec::new(), &mut none);
+        assert!(!st.locks.is_locked(&t, 2));
+    }
+
+    #[test]
+    fn a_guard_still_makes_the_whole_map_stale() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let mut t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = t.root;
+        st.selection.insert(4);
+        let r = DeleteReport {
+            failed: vec![Failed {
+                path: PathBuf::from(r"C:\t\a"),
+                size: 120,
+                reason: FailReason::GuardKept(r"C:\t\a\.g".into()),
+            }],
+            ..Default::default()
+        };
+        st.after_report(&mut t, &r);
         assert!(st.map_stale);
-        assert!(!can_delete(&BTreeSet::from([1]), true, st.map_stale));
+        assert!(st.selection.is_empty());
+        assert!(!can_delete(&BTreeSet::from([4]), true, st.map_stale));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::protect::{canonical_for_delete, is_protected, lexical_spelling, ProtectContext};
-use crate::recycle::{recycle_one, RecycleOutcome};
+use crate::protect::{
+    canonical_for_delete, canonical_key, is_protected, lexical_spelling, ProtectContext,
+};
+use crate::recycle::{is_guard_name, recycle_one, RecycleOutcome};
 use crate::scan::{self, classify, EntryClass};
 use crate::win::{self, DirEntry};
 
@@ -33,7 +35,8 @@ pub enum FailReason {
     NotRecyclable,
     /// The guard was left at this path and the file was not confirmed back under its
     /// name: the restore failed, the guard could not be read, or a different file
-    /// sits at the original name. The file's data may be only here.
+    /// sits at the original name. The file's data may be only here. A permanent delete
+    /// also reports this for a guard it found in a folder and kept.
     GuardKept(PathBuf),
     Other(String),
 }
@@ -79,8 +82,12 @@ fn reason_from_io(err: &io::Error) -> FailReason {
 
 /// Keeps what to tell the user about a partial delete: the first problem, unless
 /// a file turns out to be in use, which is the one the user can do something about.
+/// Guards found on the way are kept and listed.
 #[derive(Default)]
-struct Problem(Option<FailReason>);
+struct Problem {
+    first: Option<FailReason>,
+    guards: Vec<PathBuf>,
+}
 
 impl Problem {
     fn note(&mut self, err: &io::Error) {
@@ -89,9 +96,14 @@ impl Problem {
         if reason == FailReason::NotFound {
             return;
         }
-        if self.0.is_none() || reason == FailReason::InUse {
-            self.0 = Some(reason);
+        if self.first.is_none() || reason == FailReason::InUse {
+            self.first = Some(reason);
         }
+    }
+
+    /// A folder holding a kept guard cannot be empty, which is no problem of its own.
+    fn holds_a_guard(&self, folder: &Path) -> bool {
+        self.guards.iter().any(|guard| guard.starts_with(folder))
     }
 }
 
@@ -120,13 +132,15 @@ enum Step {
 }
 
 /// Removes everything it can under `root`. Links are removed as links. A file
-/// that cannot go is skipped so the rest still does. Keeps its own stack because
+/// that cannot go is skipped so the rest still does, and a guard is never removed,
+/// since its data may exist nowhere else. Keeps its own stack because
 /// a tree can be nested deeper than the thread's stack allows.
 fn remove_tree(root: &Path, entry: DirEntry) -> Problem {
     let mut problem = Problem::default();
     let mut steps = vec![Step::Visit(root.to_path_buf(), entry)];
     while let Some(step) = steps.pop() {
         match step {
+            Step::RemoveEmptied(path, _) if problem.holds_a_guard(&path) => {}
             Step::RemoveEmptied(path, attrs) => {
                 if let Err(e) = remove_entry(&path, attrs) {
                     problem.note(&e);
@@ -146,6 +160,7 @@ fn remove_tree(root: &Path, entry: DirEntry) -> Problem {
                         Err(e) => problem.note(&e),
                     }
                 }
+                EntryClass::File if is_guard_name(&entry.name) => problem.guards.push(path),
                 EntryClass::File | EntryClass::Link => {
                     if let Err(e) = remove_entry(&path, entry.attrs) {
                         problem.note(&e);
@@ -189,10 +204,18 @@ fn delete_permanently(target: &Target, path: &Path, entry: DirEntry, report: &mu
         _ => {
             let remaining = remaining_size(path).unwrap_or(target.size);
             report.bytes_freed += target.size.saturating_sub(remaining);
-            let reason = problem
-                .0
-                .unwrap_or_else(|| FailReason::Other("still present after deleting".into()));
-            report.failed.push(failure(target, reason));
+            let kept_only = problem.first.is_none() && !problem.guards.is_empty();
+            for guard in problem.guards {
+                report
+                    .failed
+                    .push(failure(target, FailReason::GuardKept(guard)));
+            }
+            if !kept_only {
+                let reason = problem
+                    .first
+                    .unwrap_or_else(|| FailReason::Other("still present after deleting".into()));
+                report.failed.push(failure(target, reason));
+            }
         }
     }
 }
@@ -205,6 +228,15 @@ fn failure(target: &Target, reason: FailReason) -> Failed {
     }
 }
 
+/// Whether the last name of `path`, also under its long spelling, is a guard's.
+fn names_a_guard(path: &Path) -> bool {
+    let guard_named = |p: &Path| {
+        p.file_name()
+            .is_some_and(|name| is_guard_name(&name.to_string_lossy()))
+    };
+    guard_named(path) || canonical_key(path).is_some_and(|key| guard_named(Path::new(&key)))
+}
+
 fn delete_one(target: &Target, mode: DeleteMode, ctx: &ProtectContext, report: &mut DeleteReport) {
     // Once per target, not per file walked: the check costs filesystem calls, and
     // nothing below a checked folder can be reached except through that folder.
@@ -212,7 +244,7 @@ fn delete_one(target: &Target, mode: DeleteMode, ctx: &ProtectContext, report: &
         report.failed.push(failure(target, FailReason::Protected));
         return;
     };
-    if is_protected(&path, ctx) {
+    if is_protected(&path, ctx) || names_a_guard(&path) {
         report.failed.push(failure(target, FailReason::Protected));
         return;
     }
@@ -367,6 +399,128 @@ mod tests {
         let mut perms = fs::metadata(p).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(p, perms).unwrap();
+    }
+
+    const GUARD_NAME: &str = ".katharistis-guard-1-0";
+
+    #[test]
+    fn a_guard_target_is_refused_when_deleting_permanently() {
+        let dir = tmp();
+        let guard = dir.path().join(GUARD_NAME);
+        write_kib(&guard, 4);
+        let report = del(&[t(&guard)], DeleteMode::Permanent, &ctx());
+        assert!(report.removed.is_empty());
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].reason, FailReason::Protected);
+        assert!(guard.exists());
+    }
+
+    #[test]
+    fn the_walker_removes_everything_else_and_keeps_the_guard() {
+        let dir = tmp();
+        let top = dir.path().join("top");
+        let sub = top.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir(top.join("empty")).unwrap();
+        write_kib(&top.join("a.bin"), 8);
+        write_kib(&sub.join("b.bin"), 8);
+        let guard = sub.join(GUARD_NAME);
+        write_kib(&guard, 4);
+        let target = t(&top);
+        let report = del(std::slice::from_ref(&target), DeleteMode::Permanent, &ctx());
+
+        assert!(guard.exists(), "the guard must stay");
+        assert_eq!(fs::read(&guard).unwrap().len(), 4 * 1024);
+        assert!(!top.join("a.bin").exists());
+        assert!(!sub.join("b.bin").exists());
+        assert!(!top.join("empty").exists());
+
+        // Still there, so not "removed", and only the guard's size was not freed.
+        assert!(report.removed.is_empty());
+        assert_eq!(report.bytes_freed, target.size - size_of(&guard));
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert_eq!(report.failed[0].path, top);
+        let FailReason::GuardKept(kept) = &report.failed[0].reason else {
+            panic!("expected GuardKept: {:?}", report.failed[0].reason);
+        };
+        assert_eq!(kept.file_name().unwrap(), GUARD_NAME);
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn each_kept_guard_is_named_and_another_problem_is_not_lost() {
+        let dir = tmp();
+        let top = dir.path().join("top");
+        fs::create_dir_all(top.join("x")).unwrap();
+        fs::create_dir_all(top.join("y")).unwrap();
+        write_kib(&top.join("x").join(GUARD_NAME), 4);
+        write_kib(&top.join("y").join(".KATHARISTIS-GUARD-2-0"), 4);
+        let locked_file = top.join("open.bin");
+        write_kib(&locked_file, 4);
+        let held = lock(&locked_file);
+        let report = del(&[t(&top)], DeleteMode::Permanent, &ctx());
+        drop(held);
+        let guards = report
+            .failed
+            .iter()
+            .filter(|f| matches!(f.reason, FailReason::GuardKept(_)))
+            .count();
+        assert_eq!(guards, 2, "{:?}", report.failed);
+        assert!(report.failed.iter().any(|f| f.reason == FailReason::InUse));
+        assert_eq!(report.failed.len(), 3, "{:?}", report.failed);
+    }
+
+    #[test]
+    fn a_tree_without_a_guard_still_goes_whole() {
+        let dir = tmp();
+        let top = dir.path().join("top");
+        fs::create_dir_all(top.join("sub")).unwrap();
+        write_kib(&top.join("sub").join("katharistis-guard-not-ours"), 4);
+        let target = t(&top);
+        let report = del(std::slice::from_ref(&target), DeleteMode::Permanent, &ctx());
+        assert_eq!(report.removed, std::slice::from_ref(&top));
+        assert_eq!(report.bytes_freed, target.size);
+        assert!(report.failed.is_empty());
+        assert!(!top.exists());
+    }
+
+    #[test]
+    fn a_guard_target_is_refused_on_the_way_to_the_bin() {
+        let dir = tmp();
+        let guard = dir.path().join(GUARD_NAME);
+        write_kib(&guard, 4);
+        let spelled = lexical_spelling(&guard).unwrap();
+        let report = del(&[t(&guard)], DeleteMode::RecycleBin, &ctx());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].reason, FailReason::Protected);
+        assert!(report.recycled.is_empty());
+        assert_eq!(report.bytes_in_bin, 0);
+        assert!(guard.exists());
+        assert!(!shell_was_called_for(&guard));
+        assert!(!shell_was_called_for(&spelled));
+    }
+
+    #[test]
+    fn a_folder_holding_a_guard_is_not_recyclable_without_a_shell_call() {
+        let dir = tmp();
+        let top = dir.path().join("top");
+        let deep = top.join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        write_kib(&top.join("f.bin"), 4);
+        let guard = deep.join(GUARD_NAME);
+        write_kib(&guard, 4);
+        let spelled = lexical_spelling(&top).unwrap();
+        let report = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].reason, FailReason::NotRecyclable);
+        assert!(report.recycled.is_empty());
+        assert!(report.removed.is_empty());
+        assert_eq!(report.bytes_in_bin, 0);
+        assert!(guard.exists());
+        assert!(top.join("f.bin").exists());
+        assert!(!shell_was_called_for(&top));
+        assert!(!shell_was_called_for(&spelled));
     }
 
     fn shell_was_called_for(p: &Path) -> bool {
