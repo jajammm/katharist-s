@@ -110,6 +110,7 @@ pub fn request_from(cats: &[JunkCategory]) -> Option<ConfirmRequest> {
         warn_app_owned: 0,
         context: ConfirmContext::Cleanup,
         empty_bin: empty_bin.then_some(bin_size),
+        guards: Vec::new(),
     })
 }
 

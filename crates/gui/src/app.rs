@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::CreationContext;
 use katharistis_core::format::format_size;
@@ -7,7 +8,7 @@ use katharistis_core::scan::ScanTree;
 use katharistis_core::settings::{self, Settings, Theme};
 use katharistis_core::win;
 
-use crate::confirm::{self, ConfirmContext, ConfirmRequest, DeleteFlow};
+use crate::confirm::{self, ConfirmContext, ConfirmRequest, DeleteFlow, Guards};
 use crate::i18n::{self, l};
 use crate::jobs::Job;
 use crate::views::clean::{self, CleanState};
@@ -31,7 +32,9 @@ pub enum Tool {
 pub struct App {
     pub tool: Tool,
     pub settings: Settings,
-    pub tree: Option<ScanTree>,
+    /// Shared with the jobs that read it (the duplicate search, the list builds), so
+    /// none of them has to copy it. A delete changes it only when no job holds it.
+    pub tree: Option<Arc<ScanTree>>,
     settings_path: PathBuf,
     save_error: Option<String>,
     new_excluded: String,
@@ -44,6 +47,11 @@ pub struct App {
     flow: DeleteFlow,
     /// The context of the request that started `flow`, which the report depends on.
     flow_context: ConfirmContext,
+    /// The duplicate groups of the request that started `flow`, checked again by its
+    /// worker right before it deletes.
+    flow_guards: Guards,
+    /// Reports whose tree update waits for a job to let go of the tree: `(epoch, report)`.
+    pending_reports: Vec<(u64, katharistis_core::delete::DeleteReport)>,
     clean: CleanState,
     large: LargeState,
     stale: StaleState,
@@ -71,6 +79,8 @@ impl App {
             home,
             flow: DeleteFlow::Idle,
             flow_context: ConfirmContext::User,
+            flow_guards: Vec::new(),
+            pending_reports: Vec::new(),
             clean: CleanState::default(),
             large: LargeState::default(),
             stale: StaleState::default(),
@@ -98,9 +108,10 @@ impl App {
     }
 
     /// Opens the confirmation. Only one flow runs at a time.
-    fn start_flow(&mut self, request: ConfirmRequest) {
+    fn start_flow(&mut self, mut request: ConfirmRequest) {
         if self.flow.is_idle() {
             self.flow_context = request.context;
+            self.flow_guards = std::mem::take(&mut request.guards);
             self.flow = DeleteFlow::Confirm(request);
         }
     }
@@ -109,14 +120,17 @@ impl App {
     /// line with what it did.
     fn run_flow(&mut self, ctx: &egui::Context) {
         let was_working = self.flow.is_working();
-        if let Some(report) =
-            confirm::show_flow(ctx, &mut self.flow, &self.protect, self.flow_context)
-        {
-            if let Some(tree) = &mut self.tree {
-                self.home.after_report(tree, &report);
-            }
+        if let Some(report) = confirm::show_flow(
+            ctx,
+            &mut self.flow,
+            &self.protect,
+            self.flow_context,
+            &self.flow_guards,
+        ) {
             self.dupes.after_report(&report);
+            self.pending_reports.push((self.home.epoch(), report));
         }
+        self.apply_pending(ctx);
         if self.flow.outcome_unknown() {
             self.home.mark_stale();
         }
@@ -128,6 +142,30 @@ impl App {
             }
         }
         self.guard_close(ctx);
+    }
+
+    /// Puts finished deletes into the tree. A job reading the tree (a duplicate
+    /// search, a list build) holds a share of it, and changing it then would copy it
+    /// on the UI thread. So the search is cancelled and the update waits for the job to
+    /// let go, a few frames at most.
+    fn apply_pending(&mut self, ctx: &egui::Context) {
+        let epoch = self.home.epoch();
+        self.pending_reports.retain(|(e, _)| *e == epoch);
+        if self.pending_reports.is_empty() {
+            return;
+        }
+        let Some(tree) = self.tree.as_mut() else {
+            self.pending_reports.clear();
+            return;
+        };
+        let Some(tree) = Arc::get_mut(tree) else {
+            self.dupes.cancel_search();
+            ctx.request_repaint();
+            return;
+        };
+        for (_, report) in self.pending_reports.drain(..) {
+            self.home.after_report(tree, &report);
+        }
     }
 
     /// Keeps the window open while a job that can change the disk runs.
@@ -246,6 +284,10 @@ impl eframe::App for App {
         let before = (self.settings.language, self.settings.theme);
         let ctx = ui.ctx().clone();
         self.home.poll(&ctx, &mut self.tree);
+        self.apply_pending(&ctx);
+        if self.tool != Tool::Dupes {
+            self.dupes.leave();
+        }
         self.poll_drive();
         self.clean.poll();
         egui::Panel::left("nav")
@@ -269,7 +311,7 @@ impl eframe::App for App {
                         let action = home::show(
                             ui,
                             &mut self.home,
-                            self.tree.as_ref(),
+                            self.tree.as_deref(),
                             self.settings.stale_days,
                             &self.protect,
                         );

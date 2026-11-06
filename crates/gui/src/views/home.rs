@@ -5,6 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use egui::{Align, Layout, RichText, Sense};
@@ -309,6 +310,7 @@ pub fn request_from_selection(
         mode,
         context: ConfirmContext::User,
         empty_bin: None,
+        guards: Vec::new(),
     }
 }
 
@@ -615,7 +617,7 @@ impl HomeState {
         ctx: &egui::Context,
         root: PathBuf,
         excluded: Vec<PathBuf>,
-        tree: &mut Option<ScanTree>,
+        tree: &mut Option<Arc<ScanTree>>,
     ) {
         *tree = None;
         self.scan_error = None;
@@ -692,7 +694,7 @@ impl HomeState {
 
     /// Takes in whatever background work has finished. Runs every frame on every
     /// screen, so a scan finishes also while another tool is open.
-    pub fn poll(&mut self, ctx: &egui::Context, tree: &mut Option<ScanTree>) {
+    pub fn poll(&mut self, ctx: &egui::Context, tree: &mut Option<Arc<ScanTree>>) {
         if let Some(outcome) = self.marks_job.as_mut().and_then(Job::poll) {
             self.marks_job = None;
             self.marks_failed = outcome.is_err();
@@ -721,7 +723,7 @@ impl HomeState {
                     self.location = new_tree.root;
                     self.reset_view();
                     self.new_tree();
-                    *tree = Some(new_tree);
+                    *tree = Some(Arc::new(new_tree));
                     self.refresh_space(ctx);
                 }
                 Ok(Err(e)) => self.scan_error = Some(e.to_string()),

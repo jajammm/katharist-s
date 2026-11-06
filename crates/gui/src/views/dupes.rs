@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::RichText;
@@ -234,6 +235,7 @@ pub fn apply_check(
         warn_app_owned,
         context: ConfirmContext::Duplicates,
         empty_bin: None,
+        guards: checked.ok.clone(),
     })
 }
 
@@ -277,6 +279,21 @@ pub struct DupesState {
 }
 
 impl DupesState {
+    /// The user left the screen. A finished check is dropped unseen, so no
+    /// confirmation can appear later on another screen; what is ticked stays.
+    pub fn leave(&mut self) {
+        if matches!(self.phase, Some(Phase::Checking { .. })) {
+            self.phase = None;
+        }
+    }
+
+    /// Stops a search that holds the tree, so a delete can change the tree.
+    pub fn cancel_search(&mut self) {
+        if let Some(Phase::Finding { progress, .. }) = &self.phase {
+            progress.cancel();
+        }
+    }
+
     fn idle(&self) -> bool {
         self.phase.is_none()
     }
@@ -448,7 +465,7 @@ fn placeholder_node() -> katharistis_core::scan::Node {
 pub fn show(
     ui: &mut egui::Ui,
     st: &mut DupesState,
-    tree: Option<&ScanTree>,
+    tree: Option<&Arc<ScanTree>>,
     home: &HomeState,
     protect: &ProtectContext,
     flow_busy: bool,
@@ -524,7 +541,7 @@ pub fn show(
     }
 }
 
-fn controls(ui: &mut egui::Ui, st: &mut DupesState, tree: &ScanTree, home: &HomeState) {
+fn controls(ui: &mut egui::Ui, st: &mut DupesState, tree: &Arc<ScanTree>, home: &HomeState) {
     let idle = st.idle();
     ui.horizontal(|ui| {
         let label = if st.sel.is_some() {
@@ -533,11 +550,11 @@ fn controls(ui: &mut egui::Ui, st: &mut DupesState, tree: &ScanTree, home: &Home
             l("Find duplicates", "Cari duplikat")
         };
         if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
-            let copy = tree.clone();
+            let shared = Arc::clone(tree);
             let progress = ScanProgress::default();
             let seen = progress.clone();
             let job = Job::spawn(ui.ctx().clone(), move || {
-                find_duplicates(&copy, MIN_BYTES, &seen)
+                find_duplicates(&shared, MIN_BYTES, &seen)
             });
             st.sel = None;
             st.flags.clear();
@@ -922,5 +939,66 @@ mod tests {
         };
         st.after_report(&report);
         assert!(st.sel.as_ref().unwrap().groups().is_empty());
+    }
+
+    #[test]
+    fn leaving_the_screen_drops_a_finished_check_and_keeps_the_ticks() {
+        let mut sel = two_groups();
+        sel.toggle(0, Path::new(r"C:\a\x1"));
+        let mut st = DupesState {
+            sel: Some(sel),
+            ..DupesState::default()
+        };
+        st.phase = Some(Phase::Checking {
+            job: Job::spawn(egui::Context::default(), || Checked {
+                ok: vec![(group(r"C:\a\k1", &[r"C:\a\x1"]), vec![r"C:\a\x1".into()])],
+                failed: Vec::new(),
+            }),
+            mode: DeleteMode::RecycleBin,
+            generation: 0,
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        st.leave();
+        assert!(st.phase.is_none());
+        assert!(st.poll(0).is_none(), "nothing may start after leaving");
+        assert_eq!(st.sel.as_ref().unwrap().picked_count(), 1);
+    }
+
+    #[test]
+    fn a_running_search_is_not_dropped_by_leaving_but_can_be_cancelled() {
+        let progress = ScanProgress::default();
+        let mut st = DupesState {
+            phase: Some(Phase::Finding {
+                job: Job::spawn(egui::Context::default(), Vec::new),
+                progress: progress.clone(),
+                generation: 0,
+            }),
+            ..DupesState::default()
+        };
+        st.leave();
+        assert!(matches!(st.phase, Some(Phase::Finding { .. })));
+        st.cancel_search();
+        assert!(progress.is_cancelled());
+    }
+
+    #[test]
+    fn the_request_carries_the_checked_groups_for_the_check_at_delete_time() {
+        let mut sel = two_groups();
+        sel.toggle(0, Path::new(r"C:\a\x1"));
+        let checked = check_groups(snapshot(&sel), |_, _| true);
+        let flags: HashMap<PathBuf, RowFlags> = [(PathBuf::from(r"C:\a\x1"), ok_flags())].into();
+        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::Permanent).unwrap();
+        assert_eq!(request.guards.len(), 1);
+        assert_eq!(request.guards[0].0.keep, PathBuf::from(r"C:\a\k1"));
+        assert_eq!(request.guards[0].1, vec![PathBuf::from(r"C:\a\x1")]);
+    }
+
+    #[test]
+    fn a_row_without_flags_has_no_checkbox_and_stays_out_of_the_request() {
+        assert!(!can_select(None));
+        let mut sel = two_groups();
+        sel.toggle(0, Path::new(r"C:\a\x1"));
+        let checked = check_groups(snapshot(&sel), |_, _| true);
+        assert!(apply_check(&mut sel, &checked, &HashMap::new(), DeleteMode::Permanent).is_none());
     }
 }

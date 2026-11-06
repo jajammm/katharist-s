@@ -1,6 +1,7 @@
 //! Files not changed since a threshold: 6 months, 1 year or 2 years, oldest first.
 //! One year is where it starts. The rows come from the shared tree.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use katharistis_core::analysis::stale_files;
@@ -65,7 +66,7 @@ pub fn rows(tree: &ScanTree, age: Age, now: SystemTime) -> Vec<NodeId> {
 pub fn show(
     ui: &mut egui::Ui,
     st: &mut StaleState,
-    tree: Option<&ScanTree>,
+    tree: Option<&Arc<ScanTree>>,
     home: &HomeState,
     protect: &ProtectContext,
 ) -> Option<HomeAction> {
@@ -95,7 +96,10 @@ pub fn show(
             "No file has gone unchanged that long.",
             "Tidak ada file yang selama itu tidak diubah.",
         ),
-        |tree| rows(tree, age, SystemTime::now()),
+        {
+            let now = SystemTime::now();
+            move |tree| rows(tree, age, now)
+        },
     )
 }
 

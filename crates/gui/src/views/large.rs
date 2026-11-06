@@ -1,6 +1,8 @@
 //! The largest files of the scanned location: 100 MB and up, biggest first. The rows
 //! come from the shared tree; a delete goes through the same flow as Home's.
 
+use std::sync::Arc;
+
 use katharistis_core::analysis::{large_files, LARGE_MIN};
 use katharistis_core::protect::ProtectContext;
 use katharistis_core::scan::{NodeId, ScanTree};
@@ -22,7 +24,7 @@ pub fn rows(tree: &ScanTree) -> Vec<NodeId> {
 pub fn show(
     ui: &mut egui::Ui,
     st: &mut LargeState,
-    tree: Option<&ScanTree>,
+    tree: Option<&Arc<ScanTree>>,
     home: &HomeState,
     protect: &ProtectContext,
 ) -> Option<HomeAction> {

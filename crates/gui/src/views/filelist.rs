@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
@@ -14,34 +15,75 @@ use katharistis_core::protect::ProtectContext;
 use katharistis_core::scan::{NodeId, ScanTree};
 
 use crate::i18n::l;
+use crate::jobs::Job;
 use crate::views::home::{
-    action_bar, can_select, cell, compute_flags, format_date, name_width, row_marks, HomeAction,
-    HomeState, RowFlags, CHECK_WIDTH, DATE_WIDTH, FLAG_ROWS_PER_FRAME, MARK_WIDTH, SIZE_WIDTH,
+    action_bar, can_select, cell, compute_flags, format_date, location_or_root, name_width,
+    row_marks, HomeAction, HomeState, RowFlags, CHECK_WIDTH, DATE_WIDTH, FLAG_ROWS_PER_FRAME,
+    MARK_WIDTH, SIZE_WIDTH,
 };
 
-/// A list made from one state of the tree. `stamp` is the tree's generation and the
-/// screen's own choice (such as an age) when it was built; when either moves, the
-/// rows, the flags and the ticks all go.
+/// A list made from the tree. The first build walks and sorts every node, so it runs
+/// in a job and the screen says so meanwhile. It is made again only for a new tree or
+/// a new choice of the screen (`key`). After a delete the rows that left the tree are
+/// taken out of the list instead; nothing is walked again.
 #[derive(Default)]
 pub struct FileList {
+    /// `(epoch, key)` the rows were built for.
     stamp: Option<(u64, u64)>,
+    /// The tree generation the rows, flags and ticks are in line with.
+    seen_generation: u64,
+    build: Option<Job<Vec<NodeId>>>,
+    failed: bool,
     pub ids: Vec<NodeId>,
     pub flags: HashMap<NodeId, RowFlags>,
     pub selection: BTreeSet<NodeId>,
 }
 
+/// Takes out every id that is no longer reachable from the root.
+pub fn prune_gone(tree: &ScanTree, ids: &mut Vec<NodeId>) {
+    ids.retain(|&id| location_or_root(tree, id) == id);
+}
+
 impl FileList {
-    /// Builds the rows again, and drops every tick, unless the stamp is the same.
-    /// Returns whether it built them.
-    pub fn sync(&mut self, generation: u64, key: u64, build: impl FnOnce() -> Vec<NodeId>) -> bool {
-        if self.stamp == Some((generation, key)) {
-            return false;
+    /// Brings the list in line with the tree. `build` runs in a job, and only when
+    /// the epoch or `key` is new. Any change of the tree drops the ticks and the
+    /// flags, and what left the tree leaves the rows.
+    pub fn sync(
+        &mut self,
+        ctx: &egui::Context,
+        tree: &Arc<ScanTree>,
+        (epoch, generation): (u64, u64),
+        key: u64,
+        build: impl FnOnce(&ScanTree) -> Vec<NodeId> + Send + 'static,
+    ) {
+        if self.stamp != Some((epoch, key)) {
+            self.stamp = Some((epoch, key));
+            self.seen_generation = generation;
+            self.ids = Vec::new();
+            self.flags.clear();
+            self.selection.clear();
+            self.failed = false;
+            let shared = Arc::clone(tree);
+            self.build = Some(Job::spawn(ctx.clone(), move || build(&shared)));
         }
-        self.stamp = Some((generation, key));
-        self.ids = build();
-        self.flags.clear();
-        self.selection.clear();
-        true
+        if let Some(job) = &mut self.build {
+            match job.poll() {
+                None => return,
+                Some(Ok(ids)) => self.ids = ids,
+                Some(Err(_)) => self.failed = true,
+            }
+            self.build = None;
+        }
+        if self.seen_generation != generation {
+            self.seen_generation = generation;
+            prune_gone(tree, &mut self.ids);
+            self.flags.clear();
+            self.selection.clear();
+        }
+    }
+
+    pub fn building(&self) -> bool {
+        self.build.is_some()
     }
 
     /// A stale map allows no tick at all.
@@ -236,13 +278,13 @@ pub fn draw_rows(
 pub fn show_list(
     ui: &mut egui::Ui,
     salt: &str,
-    tree: Option<&ScanTree>,
+    tree: Option<&Arc<ScanTree>>,
     home: &HomeState,
     protect: &ProtectContext,
     list: &mut FileList,
     key: u64,
     empty_text: &str,
-    build: impl FnOnce(&ScanTree) -> Vec<NodeId>,
+    build: impl FnOnce(&ScanTree) -> Vec<NodeId> + Send + 'static,
 ) -> Option<HomeAction> {
     let Some(tree) = tree else {
         return without_tree(ui, home);
@@ -263,8 +305,29 @@ pub fn show_list(
             "Daftar aplikasi tidak terbaca, jadi tanda \"dipakai aplikasi\" tidak ada.",
         ));
     }
-    list.sync(home.generation(), key, || build(tree));
+    list.sync(
+        ui.ctx(),
+        tree,
+        (home.epoch(), home.generation()),
+        key,
+        build,
+    );
     list.drop_ticks_if_stale(home.map_stale());
+    if list.building() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(l("Reading the scan...", "Membaca hasil pindai..."));
+        });
+        return action;
+    }
+    if list.failed {
+        ui.label(l(
+            "The list stopped unexpectedly. Scan again.",
+            "Daftar berhenti tiba-tiba. Pindai ulang.",
+        ));
+        return action;
+    }
     if list.ids.is_empty() {
         ui.add_space(6.0);
         ui.weak(empty_text);
@@ -289,59 +352,112 @@ pub fn show_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use crate::views::test_support::{file, tree_of};
+    use std::time::Instant;
 
-    #[test]
-    fn the_list_is_built_once_per_tree_state_and_key() {
-        let mut list = FileList::default();
-        let builds = Cell::new(0);
-        let build = || {
-            builds.set(builds.get() + 1);
-            vec![1, 2]
-        };
-        assert!(list.sync(3, 0, build));
-        assert!(!list.sync(3, 0, build));
-        assert_eq!(builds.get(), 1);
-        assert!(list.sync(3, 1, build));
-        assert!(list.sync(4, 1, build));
-        assert_eq!(builds.get(), 3);
+    fn ok_flags() -> RowFlags {
+        RowFlags {
+            protected: false,
+            app_owned: false,
+            guard: false,
+            locked: false,
+        }
+    }
+
+    /// Syncs until the build job has landed.
+    fn settle(
+        list: &mut FileList,
+        ctx: &egui::Context,
+        tree: &Arc<ScanTree>,
+        at: (u64, u64),
+        key: u64,
+    ) {
+        let start = Instant::now();
+        loop {
+            list.sync(ctx, tree, at, key, |_| panic!("no rebuild expected"));
+            if !list.building() {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn start(
+        list: &mut FileList,
+        ctx: &egui::Context,
+        tree: &Arc<ScanTree>,
+        at: (u64, u64),
+        key: u64,
+    ) {
+        list.sync(ctx, tree, at, key, |t| (1..t.nodes.len()).collect());
+        let start = Instant::now();
+        while list.building() {
+            list.sync(ctx, tree, at, key, |_| panic!("no rebuild expected"));
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
-    fn ticks_and_flags_clear_when_the_tree_changes() {
+    fn the_first_build_runs_in_a_job_and_the_list_says_so() {
+        let ctx = egui::Context::default();
+        let tree = Arc::new(tree_of(vec![file("a", 1), file("b", 2)]));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
         let mut list = FileList::default();
-        list.sync(1, 0, || vec![1, 2, 3]);
+        list.sync(&ctx, &tree, (1, 1), 0, move |_| {
+            rx.recv().unwrap();
+            vec![1, 2]
+        });
+        assert!(list.building());
+        assert!(list.ids.is_empty());
+        tx.send(()).unwrap();
+        settle(&mut list, &ctx, &tree, (1, 1), 0);
+        assert_eq!(list.ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_delete_takes_rows_out_without_building_again() {
+        let ctx = egui::Context::default();
+        let mut tree = Arc::new(tree_of(vec![file("a", 1), file("b", 2), file("c", 3)]));
+        let mut list = FileList::default();
+        start(&mut list, &ctx, &tree, (1, 1), 0);
+        assert_eq!(list.ids, vec![1, 2, 3]);
         list.selection.insert(2);
-        list.flags.insert(
-            2,
-            RowFlags {
-                protected: false,
-                app_owned: false,
-                guard: false,
-                locked: false,
-            },
-        );
-        assert!(!list.sync(1, 0, Vec::new));
-        assert_eq!(list.selection.len(), 1);
-        list.sync(2, 0, || vec![1, 3]);
+        list.flags.insert(2, ok_flags());
+        // The job has let go, so the tree can change in place.
+        Arc::get_mut(&mut tree).unwrap().remove_subtree(2);
+        settle(&mut list, &ctx, &tree, (1, 2), 0);
+        assert_eq!(list.ids, vec![1, 3]);
         assert!(list.selection.is_empty());
         assert!(list.flags.is_empty());
-        assert_eq!(list.ids, vec![1, 3]);
     }
 
     #[test]
-    fn a_choice_change_clears_ticks_too() {
+    fn a_new_tree_or_a_new_choice_builds_again_and_clears_ticks() {
+        let ctx = egui::Context::default();
+        let tree = Arc::new(tree_of(vec![file("a", 1), file("b", 2)]));
         let mut list = FileList::default();
-        list.sync(1, 0, || vec![1, 2]);
+        start(&mut list, &ctx, &tree, (1, 1), 0);
         list.selection.insert(1);
-        list.sync(1, 1, || vec![1]);
+        start(&mut list, &ctx, &tree, (1, 1), 1);
         assert!(list.selection.is_empty());
+        list.selection.insert(1);
+        start(&mut list, &ctx, &tree, (2, 5), 1);
+        assert!(list.selection.is_empty());
+        assert_eq!(list.ids, vec![1, 2]);
     }
 
     #[test]
-    fn a_stale_map_drops_every_tick() {
+    fn a_stale_mark_clears_ticks_and_keeps_the_rows() {
+        let ctx = egui::Context::default();
+        let tree = Arc::new(tree_of(vec![file("a", 1)]));
         let mut list = FileList::default();
-        list.sync(1, 0, || vec![1, 2]);
+        start(&mut list, &ctx, &tree, (1, 1), 0);
+        list.selection.insert(1);
+        settle(&mut list, &ctx, &tree, (1, 2), 0);
+        assert!(list.selection.is_empty());
+        assert_eq!(list.ids, vec![1]);
         list.selection.insert(1);
         list.drop_ticks_if_stale(false);
         assert_eq!(list.selection.len(), 1);

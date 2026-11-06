@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use katharistis_core::delete::{self, DeleteMode, DeleteReport, FailReason, Target};
+use katharistis_core::dupes::{targets_still_safe, DuplicateGroup};
 use katharistis_core::format::format_size;
 use katharistis_core::protect::ProtectContext;
 use katharistis_core::recycle;
@@ -22,6 +23,65 @@ pub struct ConfirmRequest {
     /// `Some(size)` when the same confirmation also empties the Recycle Bin, which
     /// held `size` bytes when it was read. Raised only by the cleanup screen.
     pub empty_bin: Option<u64>,
+    /// Duplicate groups with the files of each that this request deletes. The delete
+    /// checks each group again in its own job, right before it deletes, and leaves
+    /// alone every file of a group whose copy to keep changed. Empty for any other
+    /// screen.
+    pub guards: Guards,
+}
+
+/// Each group with the files of it that are to go.
+pub type Guards = Vec<(DuplicateGroup, Vec<PathBuf>)>;
+
+/// Splits `items` into what may go and what is left alone: every file of a group that
+/// fails `safe`. The left-alone files come back as failures with `KeeperChanged`.
+pub fn split_unsafe(
+    items: &[Target],
+    guards: &[(DuplicateGroup, Vec<PathBuf>)],
+    safe: fn(&DuplicateGroup, &[PathBuf]) -> bool,
+) -> (Vec<Target>, Vec<delete::Failed>) {
+    let mut blocked: HashSet<PathBuf> = HashSet::new();
+    for (group, picked) in guards {
+        let present: Vec<PathBuf> = picked
+            .iter()
+            .filter(|p| items.iter().any(|t| &t.path == *p))
+            .cloned()
+            .collect();
+        if !present.is_empty() && !safe(group, &present) {
+            blocked.extend(present);
+        }
+    }
+    let (left, go): (Vec<Target>, Vec<Target>) = items
+        .iter()
+        .cloned()
+        .partition(|t| blocked.contains(&t.path));
+    let failed = left
+        .into_iter()
+        .map(|t| delete::Failed {
+            path: t.path,
+            size: t.size,
+            reason: FailReason::KeeperChanged,
+        })
+        .collect();
+    (go, failed)
+}
+
+/// The delete of one step, with the duplicate check first. Runs in the flow's worker.
+fn guarded_delete(
+    ops: FlowOps,
+    guards: &[(DuplicateGroup, Vec<PathBuf>)],
+    items: &[Target],
+    mode: DeleteMode,
+    protect: &ProtectContext,
+) -> DeleteReport {
+    let (go, left) = split_unsafe(items, guards, ops.safe);
+    let mut report = if go.is_empty() {
+        DeleteReport::default()
+    } else {
+        (ops.delete)(&go, mode, protect)
+    };
+    report.failed.extend(left);
+    report
 }
 
 // `Leftovers` is raised by the screen of task 16.
@@ -370,6 +430,11 @@ pub fn reason_text(reason: &FailReason) -> String {
             ),
             guard.display()
         ),
+        FailReason::KeeperChanged => l(
+            "Left alone. The copy to keep changed, so this one may now be the last.",
+            "Dibiarkan. Salinan yang disimpan berubah, jadi ini mungkin kini satu-satunya.",
+        )
+        .to_string(),
         FailReason::Other(text) => text.clone(),
     }
 }
@@ -441,12 +506,15 @@ enum FlowEvent {
 #[derive(Clone, Copy)]
 struct FlowOps {
     delete: fn(&[Target], DeleteMode, &ProtectContext) -> DeleteReport,
+    /// The check of a duplicate group, run again right before its files go.
+    safe: fn(&DuplicateGroup, &[PathBuf]) -> bool,
     bin_info: fn() -> io::Result<(u64, u64)>,
     empty_bin: fn() -> io::Result<()>,
 }
 
 const REAL_OPS: FlowOps = FlowOps {
     delete: delete::delete,
+    safe: targets_still_safe,
     bin_info: recycle::bin_info,
     empty_bin: recycle::empty_bin,
 };
@@ -550,6 +618,7 @@ fn apply_event(
     event: FlowEvent,
     protect: &ProtectContext,
     ops: FlowOps,
+    guards: &[(DuplicateGroup, Vec<PathBuf>)],
 ) -> Option<DeleteReport> {
     let state = std::mem::replace(flow, DeleteFlow::Idle);
     match (state, event) {
@@ -559,13 +628,14 @@ fn apply_event(
             // The confirmation named both, so one press runs the delete and then the
             // emptying, and the bin is read before and after.
             let protect = protect.clone();
+            let guards = guards.to_vec();
             let items = req.items;
             let mode = req.mode;
             let sent = items.clone();
             *flow = DeleteFlow::RunningWithBin(
                 Job::spawn(ctx.clone(), move || {
                     let before = (ops.bin_info)().ok();
-                    let report = (ops.delete)(&items, mode, &protect);
+                    let report = guarded_delete(ops, &guards, &items, mode, &protect);
                     (report, empty_and_read_back(ops, before))
                 }),
                 sent,
@@ -585,15 +655,17 @@ fn apply_event(
             None
         }
         (DeleteFlow::Confirm(req), FlowEvent::Confirm) if !req.items.is_empty() => {
+            let guards = guards.to_vec();
             let protect = protect.clone();
             *flow = DeleteFlow::Running(Job::spawn(ctx.clone(), move || {
-                (ops.delete)(&req.items, req.mode, &protect)
+                guarded_delete(ops, &guards, &req.items, req.mode, &protect)
             }));
             None
         }
         (DeleteFlow::Confirm(_), FlowEvent::Dismiss) => None,
         (DeleteFlow::ConfirmPermanent(offer, report), FlowEvent::Confirm) => {
             let sent = offer.selected();
+            let guards = guards.to_vec();
             if sent.is_empty() {
                 *flow = DeleteFlow::ConfirmPermanent(offer, report);
                 return None;
@@ -601,7 +673,7 @@ fn apply_event(
             let protect = protect.clone();
             let items = sent.clone();
             let job = Job::spawn(ctx.clone(), move || {
-                (ops.delete)(&items, DeleteMode::Permanent, &protect)
+                guarded_delete(ops, &guards, &items, DeleteMode::Permanent, &protect)
             });
             *flow = DeleteFlow::RunningPermanent(job, sent, report);
             None
@@ -979,10 +1051,11 @@ fn drive_flow(
     protect: &ProtectContext,
     context: ConfirmContext,
     ops: FlowOps,
+    guards: &[(DuplicateGroup, Vec<PathBuf>)],
 ) -> Option<DeleteReport> {
     let polled = poll_flow(flow);
-    let applied =
-        render_flow(ctx, flow, context).and_then(|e| apply_event(ctx, flow, e, protect, ops));
+    let applied = render_flow(ctx, flow, context)
+        .and_then(|e| apply_event(ctx, flow, e, protect, ops, guards));
     polled.or(applied)
 }
 
@@ -994,8 +1067,9 @@ pub fn show_flow(
     flow: &mut DeleteFlow,
     protect: &ProtectContext,
     context: ConfirmContext,
+    guards: &[(DuplicateGroup, Vec<PathBuf>)],
 ) -> Option<DeleteReport> {
-    drive_flow(ctx, flow, protect, context, REAL_OPS)
+    drive_flow(ctx, flow, protect, context, REAL_OPS, guards)
 }
 
 #[cfg(test)]
@@ -1027,6 +1101,7 @@ mod tests {
             warn_app_owned: 0,
             context,
             empty_bin: None,
+            guards: Vec::new(),
         }
     }
 
@@ -1055,6 +1130,9 @@ mod tests {
     fn delete_panics(_: &[Target], _: DeleteMode, _: &ProtectContext) -> DeleteReport {
         panic!("boom");
     }
+    fn safe_refused(_: &DuplicateGroup, _: &[PathBuf]) -> bool {
+        panic!("no duplicate check may run here");
+    }
     fn info_refused() -> io::Result<(u64, u64)> {
         panic!("the bin may not be read here");
     }
@@ -1064,6 +1142,7 @@ mod tests {
 
     const NO_OPS: FlowOps = FlowOps {
         delete: delete_refused,
+        safe: safe_refused,
         bin_info: info_refused,
         empty_bin: empty_refused,
     };
@@ -1270,7 +1349,7 @@ mod tests {
             delete: delete_panics,
             ..NO_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops, &[]);
         assert!(flow.is_working());
         assert!(settle(&mut flow).is_empty());
         assert!(flow.outcome_unknown());
@@ -1283,9 +1362,9 @@ mod tests {
         let mut flow = DeleteFlow::Confirm(req(DeleteMode::RecycleBin, ConfirmContext::User));
         assert!(poll_flow(&mut flow).is_none());
         assert!(matches!(flow, DeleteFlow::Confirm(_)));
-        apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, NO_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, NO_OPS, &[]);
         assert!(matches!(flow, DeleteFlow::Confirm(_)));
-        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, NO_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, NO_OPS, &[]);
         assert!(flow.is_idle());
     }
 
@@ -1297,9 +1376,10 @@ mod tests {
             warn_app_owned: 0,
             context: ConfirmContext::User,
             empty_bin: None,
+            guards: Vec::new(),
         });
         let ctx = egui::Context::default();
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS, &[]);
         assert!(matches!(flow, DeleteFlow::Confirm(_)));
     }
 
@@ -1332,7 +1412,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut flow = running(with_not_recyclable());
         settle(&mut flow);
-        let got = apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &protect(), NO_OPS);
+        let got = apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &protect(), NO_OPS, &[]);
         let got = got.expect("the report");
         assert_eq!(got.failed.len(), 3);
         assert_eq!(got.bytes_freed, 0);
@@ -1345,7 +1425,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut flow = running(with_not_recyclable());
         settle(&mut flow);
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS, &[]);
         assert!(matches!(flow, DeleteFlow::ConfirmPermanent(..)));
     }
 
@@ -1362,7 +1442,7 @@ mod tests {
             delete: delete_all_gone,
             ..NO_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops, &[]);
         let reports = settle(&mut flow);
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
@@ -1392,7 +1472,7 @@ mod tests {
             delete: delete_panics,
             ..NO_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops, &[]);
         let reports = settle(&mut flow);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_freed, 0);
@@ -1455,7 +1535,14 @@ mod tests {
     fn empty_bin_is_refused_when_not_offered() {
         let ctx = egui::Context::default();
         let mut flow = DeleteFlow::Report(DeleteReport::default());
-        apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &protect(), NO_OPS);
+        apply_event(
+            &ctx,
+            &mut flow,
+            FlowEvent::AskEmptyBin,
+            &protect(),
+            NO_OPS,
+            &[],
+        );
         assert!(matches!(flow, DeleteFlow::Report(_)));
     }
 
@@ -1485,7 +1572,7 @@ mod tests {
             bytes_in_bin: 10,
             ..Default::default()
         });
-        assert!(apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, ops).is_none());
+        assert!(apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, ops, &[]).is_none());
         assert!(settle(&mut flow).is_empty());
         assert!(matches!(
             flow,
@@ -1494,13 +1581,13 @@ mod tests {
         assert!(!FAKE_BIN_EMPTIED.load(Ordering::SeqCst));
 
         // Backing out goes back to the report and empties nothing.
-        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, ops, &[]);
         assert!(matches!(flow, DeleteFlow::Report(_)));
         assert!(!FAKE_BIN_EMPTIED.load(Ordering::SeqCst));
 
-        apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, ops);
+        apply_event(&ctx, &mut flow, FlowEvent::AskEmptyBin, &p, ops, &[]);
         settle(&mut flow);
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &p, ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &p, ops, &[]);
         assert!(flow.is_working());
         assert!(settle(&mut flow).is_empty());
         let DeleteFlow::Emptied(report, result) = &flow else {
@@ -1509,7 +1596,7 @@ mod tests {
         assert_eq!(report.bytes_in_bin, 10);
         assert_eq!(result.before, Some((100, 2)));
         assert_eq!(result.after, Some((0, 0)));
-        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, ops, &[]);
         assert!(flow.is_idle());
     }
 
@@ -1518,7 +1605,7 @@ mod tests {
         let ctx = egui::Context::default();
         let job = Job::spawn(ctx.clone(), || Ok((1, 1)));
         let mut flow = DeleteFlow::ConfirmEmptyBin(DeleteReport::default(), BinLoad::Loading(job));
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS, &[]);
         assert!(matches!(flow, DeleteFlow::ConfirmEmptyBin(..)));
     }
 
@@ -1581,7 +1668,8 @@ mod tests {
             for _ in 0..2 {
                 let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                     assert!(
-                        drive_flow(ui.ctx(), flow, &p, ConfirmContext::Cleanup, NO_OPS).is_none()
+                        drive_flow(ui.ctx(), flow, &p, ConfirmContext::Cleanup, NO_OPS, &[])
+                            .is_none()
                     );
                 });
                 out.textures_delta.clear();
@@ -1608,6 +1696,7 @@ mod tests {
     }
     const BIN_OPS: FlowOps = FlowOps {
         delete: delete_all_gone,
+        safe: safe_refused,
         bin_info: counting_info,
         empty_bin: counting_empty,
     };
@@ -1619,6 +1708,7 @@ mod tests {
             warn_app_owned: 0,
             context: ConfirmContext::Cleanup,
             empty_bin,
+            guards: Vec::new(),
         }
     }
 
@@ -1643,7 +1733,7 @@ mod tests {
         BIN_CALLS.store(0, Ordering::SeqCst);
         BIN_GONE.store(false, Ordering::SeqCst);
         let mut flow = DeleteFlow::Confirm(cleanup_req(Vec::new(), Some(500)));
-        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, BIN_OPS);
+        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, BIN_OPS, &[]);
         assert!(flow.is_idle());
         assert_eq!(BIN_CALLS.load(Ordering::SeqCst), 0);
 
@@ -1655,7 +1745,7 @@ mod tests {
             delete: delete_refused,
             ..BIN_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &p, ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &p, ops, &[]);
         assert!(flow.is_working());
         assert_eq!(settle(&mut flow).len(), 1);
         let DeleteFlow::Emptied(report, result) = &flow else {
@@ -1674,7 +1764,14 @@ mod tests {
         BIN_CALLS.store(0, Ordering::SeqCst);
         BIN_GONE.store(false, Ordering::SeqCst);
         let mut flow = DeleteFlow::Confirm(cleanup_req(vec![t(r"C:\t\a", 10)], Some(500)));
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), BIN_OPS);
+        apply_event(
+            &ctx,
+            &mut flow,
+            FlowEvent::Confirm,
+            &protect(),
+            BIN_OPS,
+            &[],
+        );
         assert!(flow.is_working());
         assert!(refuse_close(true, &flow));
         let reports = settle(&mut flow);
@@ -1697,7 +1794,7 @@ mod tests {
             delete: delete_all_gone,
             ..NO_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops, &[]);
         assert!(matches!(flow, DeleteFlow::Running(_)));
         assert_eq!(settle(&mut flow).len(), 1);
         assert!(matches!(flow, DeleteFlow::Report(_)));
@@ -1711,7 +1808,7 @@ mod tests {
             delete: delete_panics,
             ..NO_OPS
         };
-        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops, &[]);
         assert!(settle(&mut flow).is_empty());
         let DeleteFlow::OutcomeUnknown(_, unknown) = &flow else {
             panic!("expected the unknown outcome");
@@ -1735,5 +1832,143 @@ mod tests {
         let user = report_groups(&r, ConfirmContext::User);
         assert_eq!((user.skipped_in_use, user.not_done), (0, 4));
         assert!(skipped_in_use_text().contains("Skipped, in use"));
+    }
+
+    static SENT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    fn delete_recording(items: &[Target], _: DeleteMode, _: &ProtectContext) -> DeleteReport {
+        SENT.lock()
+            .unwrap()
+            .extend(items.iter().map(|t| t.path.clone()));
+        DeleteReport {
+            removed: items.iter().map(|t| t.path.clone()).collect(),
+            bytes_freed: items.iter().map(|t| t.size).sum(),
+            ..Default::default()
+        }
+    }
+
+    /// The keeper of the group named `changed` has changed since the dialog opened.
+    fn safe_unless_changed(group: &DuplicateGroup, _: &[PathBuf]) -> bool {
+        group.keep != Path::new(r"C:\d\changed_keep")
+    }
+
+    fn dup_group(keep: &str, others: &[&str]) -> (DuplicateGroup, Vec<PathBuf>) {
+        let others: Vec<PathBuf> = others.iter().map(PathBuf::from).collect();
+        (
+            DuplicateGroup {
+                size: 5,
+                keep: PathBuf::from(keep),
+                others: others.clone(),
+            },
+            others,
+        )
+    }
+
+    fn dup_ops() -> FlowOps {
+        FlowOps {
+            delete: delete_recording,
+            safe: safe_unless_changed,
+            ..NO_OPS
+        }
+    }
+
+    #[test]
+    fn a_group_that_fails_the_check_is_split_off_and_the_rest_go() {
+        let items = [t(r"C:\d\a1", 5), t(r"C:\d\a2", 5), t(r"C:\d\b1", 5)];
+        let guards = vec![
+            dup_group(r"C:\d\changed_keep", &[r"C:\d\a1", r"C:\d\a2"]),
+            dup_group(r"C:\d\good_keep", &[r"C:\d\b1"]),
+        ];
+        let (go, left) = split_unsafe(&items, &guards, safe_unless_changed);
+        assert_eq!(go.len(), 1);
+        assert_eq!(go[0].path, PathBuf::from(r"C:\d\b1"));
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|f| f.reason == FailReason::KeeperChanged));
+        assert!(!reason_text(&FailReason::KeeperChanged).is_empty());
+        let r = DeleteReport {
+            failed: left,
+            ..Default::default()
+        };
+        assert!(failed_to_lock(&r).is_empty());
+        assert!(!map_may_be_stale(&r));
+        assert!(not_recyclable(&r).is_empty());
+    }
+
+    #[test]
+    fn a_keeper_changed_after_the_dialog_opened_keeps_its_group_out_of_delete() {
+        let ctx = egui::Context::default();
+        SENT.lock().unwrap().clear();
+        let mut request = req(DeleteMode::Permanent, ConfirmContext::Duplicates);
+        request.items = vec![t(r"C:\d\a1", 5), t(r"C:\d\b1", 5)];
+        let guards = vec![
+            dup_group(r"C:\d\changed_keep", &[r"C:\d\a1"]),
+            dup_group(r"C:\d\good_keep", &[r"C:\d\b1"]),
+        ];
+        let mut flow = DeleteFlow::Confirm(request);
+        apply_event(
+            &ctx,
+            &mut flow,
+            FlowEvent::Confirm,
+            &protect(),
+            dup_ops(),
+            &guards,
+        );
+        let reports = settle(&mut flow);
+        assert_eq!(*SENT.lock().unwrap(), vec![PathBuf::from(r"C:\d\b1")]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].removed, vec![PathBuf::from(r"C:\d\b1")]);
+        assert_eq!(reports[0].failed.len(), 1);
+        assert_eq!(reports[0].failed[0].path, PathBuf::from(r"C:\d\a1"));
+        assert_eq!(reports[0].failed[0].reason, FailReason::KeeperChanged);
+    }
+
+    #[test]
+    fn when_every_group_fails_delete_is_never_called() {
+        let ctx = egui::Context::default();
+        let mut request = req(DeleteMode::Permanent, ConfirmContext::Duplicates);
+        request.items = vec![t(r"C:\d\a1", 5)];
+        let guards = vec![dup_group(r"C:\d\changed_keep", &[r"C:\d\a1"])];
+        let mut flow = DeleteFlow::Confirm(request);
+        let ops = FlowOps {
+            delete: delete_refused,
+            safe: safe_unless_changed,
+            ..NO_OPS
+        };
+        apply_event(
+            &ctx,
+            &mut flow,
+            FlowEvent::Confirm,
+            &protect(),
+            ops,
+            &guards,
+        );
+        let reports = settle(&mut flow);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].failed[0].reason, FailReason::KeeperChanged);
+    }
+
+    #[test]
+    fn the_permanent_step_is_checked_too() {
+        let ctx = egui::Context::default();
+        let guards = vec![dup_group(r"C:\d\changed_keep", &[r"C:\d\a1"])];
+        let mut offer = PermanentOffer::new(vec![t(r"C:\d\a1", 5)]);
+        offer.checked = vec![true];
+        let mut flow = DeleteFlow::ConfirmPermanent(offer, DeleteReport::default());
+        let ops = FlowOps {
+            delete: delete_refused,
+            safe: safe_unless_changed,
+            ..NO_OPS
+        };
+        apply_event(
+            &ctx,
+            &mut flow,
+            FlowEvent::Confirm,
+            &protect(),
+            ops,
+            &guards,
+        );
+        assert!(flow.is_working());
+        settle(&mut flow);
+        assert!(!flow.is_working());
     }
 }

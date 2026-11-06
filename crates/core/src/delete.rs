@@ -38,6 +38,9 @@ pub enum FailReason {
     /// sits at the original name. The file's data may be only here. A permanent delete
     /// also reports this for a guard it found in a folder and kept.
     GuardKept(PathBuf),
+    /// A duplicate left alone because its copy to keep changed or went after the
+    /// confirmation opened, so it may now be the last copy. Nothing was touched.
+    KeeperChanged,
     Other(String),
 }
 
