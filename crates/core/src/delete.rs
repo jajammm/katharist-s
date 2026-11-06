@@ -45,7 +45,7 @@ pub struct Failed {
     pub reason: FailReason,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DeleteReport {
     pub removed: Vec<PathBuf>,
     pub recycled: Vec<PathBuf>,

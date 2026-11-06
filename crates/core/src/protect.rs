@@ -28,6 +28,7 @@ const VOLUME_ROOT_ITEMS: [&str; 5] = [
     "swapfile.sys",
 ];
 
+#[derive(Clone, Debug)]
 pub struct ProtectContext {
     pub windows_dir: PathBuf,
     pub program_files: Vec<PathBuf>,

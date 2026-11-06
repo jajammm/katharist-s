@@ -2,11 +2,15 @@ use std::path::{Path, PathBuf};
 
 use eframe::CreationContext;
 use katharistis_core::format::format_size;
+use katharistis_core::protect::ProtectContext;
 use katharistis_core::scan::ScanTree;
 use katharistis_core::settings::{self, Settings, Theme};
 use katharistis_core::win;
 
+use crate::confirm::{self, DeleteFlow};
 use crate::i18n::{self, l};
+use crate::jobs::Job;
+use crate::views::home::{self, HomeAction, HomeState};
 use crate::{theme, views};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,19 +27,25 @@ pub enum Tool {
 pub struct App {
     pub tool: Tool,
     pub settings: Settings,
-    #[allow(dead_code)]
     pub tree: Option<ScanTree>,
     settings_path: PathBuf,
     save_error: Option<String>,
     new_excluded: String,
     /// `(drive label, total bytes, free bytes)` of the system drive.
     drive: Option<(String, u64, u64)>,
+    drive_job: Option<Job<Option<(String, u64, u64)>>>,
+    /// Read once: every delete and every row of the list goes by this one.
+    protect: ProtectContext,
+    home: HomeState,
+    flow: DeleteFlow,
 }
 
 impl App {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         let settings_path = settings::default_path();
         let settings = settings::load_from(&settings_path);
+        let protect = ProtectContext::from_env();
+        let home = HomeState::new(&cc.egui_ctx, &protect);
         let app = App {
             tool: Tool::Home,
             settings,
@@ -44,17 +54,60 @@ impl App {
             save_error: None,
             new_excluded: String::new(),
             drive: system_drive(),
+            drive_job: None,
+            protect,
+            home,
+            flow: DeleteFlow::Idle,
         };
         app.apply_language();
         app.apply_theme(&cc.egui_ctx);
         app
     }
 
-    /// Folders every GUI scan must skip. Task 13: pass this into
-    /// `ScanOptions::excluded` for each scan.
-    #[allow(dead_code)]
+    /// Folders every GUI scan must skip.
     pub fn excluded(&self) -> Vec<PathBuf> {
         self.settings.excluded.clone()
+    }
+
+    fn handle_home(&mut self, ctx: &egui::Context, action: HomeAction) {
+        match action {
+            HomeAction::Scan(root) => {
+                let excluded = self.excluded();
+                self.home.start_scan(ctx, root, excluded, &mut self.tree);
+            }
+            HomeAction::Delete(request) => {
+                if self.flow.is_idle() {
+                    self.flow = DeleteFlow::Confirm(request);
+                }
+            }
+        }
+    }
+
+    /// Runs the delete flow on top of whatever screen is open and brings the app in
+    /// line with what it did.
+    fn run_flow(&mut self, ctx: &egui::Context) {
+        let was_working = self.flow.is_working();
+        if let Some(report) = confirm::show_flow(ctx, &mut self.flow, &self.protect) {
+            if let Some(tree) = &mut self.tree {
+                self.home.after_report(tree, &report);
+            }
+        }
+        if self.flow.outcome_unknown() {
+            self.home.mark_stale();
+        }
+        if was_working && !self.flow.is_working() {
+            self.home.refresh_space(ctx);
+            self.drive_job = Some(Job::spawn(ctx.clone(), system_drive));
+        }
+    }
+
+    fn poll_drive(&mut self) {
+        if let Some(outcome) = self.drive_job.as_mut().and_then(Job::poll) {
+            self.drive_job = None;
+            if let Ok(drive) = outcome {
+                self.drive = drive;
+            }
+        }
     }
 
     fn apply_language(&self) {
@@ -140,6 +193,9 @@ fn system_drive() -> Option<(String, u64, u64)> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let before = (self.settings.language, self.settings.theme);
+        let ctx = ui.ctx().clone();
+        self.home.poll(&ctx, &mut self.tree);
+        self.poll_drive();
         egui::Panel::left("nav")
             .exact_size(210.0)
             .resizable(false)
@@ -157,7 +213,18 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                 }
                 match self.tool {
-                    Tool::Home => Self::placeholder(ui, l("Home", "Beranda")),
+                    Tool::Home => {
+                        let action = home::show(
+                            ui,
+                            &mut self.home,
+                            self.tree.as_ref(),
+                            self.settings.stale_days,
+                            &self.protect,
+                        );
+                        if let Some(action) = action {
+                            self.handle_home(&ctx, action);
+                        }
+                    }
                     Tool::Clean => Self::placeholder(ui, l("Cleanup", "Pembersihan")),
                     Tool::Apps => Self::placeholder(ui, l("Apps", "Aplikasi")),
                     Tool::Large => Self::placeholder(ui, l("Largest", "Terbesar")),
@@ -173,6 +240,7 @@ impl eframe::App for App {
                 }
             });
         });
+        self.run_flow(&ctx);
         if before != (self.settings.language, self.settings.theme) {
             self.apply_language();
             self.apply_theme(ui.ctx());

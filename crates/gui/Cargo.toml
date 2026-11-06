@@ -12,7 +12,7 @@ path = "src/main.rs"
 katharistis-core = { path = "../core" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 egui = { version = "0.37", default-features = false }
-windows = { version = "0.62", features = ["Win32_Globalization"] }
+windows = { version = "0.62", features = ["Win32_Globalization", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

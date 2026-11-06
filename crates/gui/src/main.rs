@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod confirm;
 mod i18n;
 mod jobs;
 mod theme;
