@@ -52,13 +52,6 @@ impl<T: Send + 'static> Job<T> {
             Slot::Taken => None,
         }
     }
-
-    /// The result once the job is done, exactly once. A panic reads as `None` here,
-    /// so anything whose failure the user must learn about uses [`Job::poll`].
-    #[allow(dead_code)]
-    pub fn try_take(&mut self) -> Option<T> {
-        self.poll()?.ok()
-    }
 }
 
 #[cfg(test)]
@@ -81,16 +74,8 @@ mod tests {
     #[test]
     fn delivers_result_once() {
         let mut job = Job::spawn(egui::Context::default(), || 7);
-        let start = Instant::now();
-        let got = loop {
-            if let Some(v) = job.try_take() {
-                break v;
-            }
-            assert!(start.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert_eq!(got, 7);
-        assert!(job.try_take().is_none());
+        assert_eq!(wait(&mut job), Ok(7));
+        assert!(job.poll().is_none());
     }
 
     #[test]
@@ -98,7 +83,6 @@ mod tests {
         let mut job: Job<i32> = Job::spawn(egui::Context::default(), || panic!("boom"));
         assert_eq!(wait(&mut job), Err(JobPanicked));
         assert!(job.poll().is_none());
-        assert!(job.try_take().is_none());
     }
 
     #[test]

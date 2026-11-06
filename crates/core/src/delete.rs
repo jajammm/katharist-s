@@ -903,7 +903,6 @@ mod tests {
         let target = t(&top);
         let _guard = lock(&locked);
         let r = del(&[target], DeleteMode::RecycleBin, &ctx());
-        eprintln!("folder with a locked file: {r:?}");
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert!(locked.exists());
         assert!(r.recycled.is_empty() && r.removed.is_empty());
@@ -1017,7 +1016,6 @@ mod tests {
 
         let r = del(&[target], DeleteMode::RecycleBin, &ctx());
 
-        eprintln!("a file that may not be deleted: {r:?}");
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::AccessDenied);
         assert_eq!(fs::metadata(&f).unwrap().len(), 4 * 1024);
@@ -1042,7 +1040,6 @@ mod tests {
 
         let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
 
-        eprintln!("{child} bytes twice against a quota of {quota}: {r:?}");
         assert!(!shell_was_called_for(&top));
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
@@ -1064,7 +1061,6 @@ mod tests {
             size: 6,
         };
         let r = del(&[target], DeleteMode::RecycleBin, &ctx());
-        eprintln!("recycling a trailing-dot name: {r:?}");
         assert!(plain.exists(), "the sibling without the dot must survive");
         let dotted_there = fs::symlink_metadata(win_long(&dotted)).is_ok();
         assert_eq!(dotted_there, !r.failed.is_empty(), "{r:?}");
@@ -1120,7 +1116,6 @@ mod tests {
         write_kib(&folder_on_subst.join("inner.bin"), 4);
 
         let r = del(&[t(&file_on_subst)], DeleteMode::RecycleBin, &ctx());
-        eprintln!("file on a subst drive: {r:?}");
         // Also shows the record uses the spelling the other tests look for.
         assert!(shell_was_called_for(&file_on_subst));
         assert_eq!(r.failed.len(), 1, "{r:?}");
@@ -1132,7 +1127,6 @@ mod tests {
         assert_no_guard(dir.path());
 
         let r = del(&[t(&folder_on_subst)], DeleteMode::RecycleBin, &ctx());
-        eprintln!("folder on a subst drive: {r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert!(folder_on_subst.join("inner.bin").exists());
 
@@ -1181,8 +1175,7 @@ mod tests {
 
         let file = fs::OpenOptions::new().write(true).open(p).unwrap();
         let mut size = logical;
-        while let Err(e) = file.set_len(size) {
-            eprintln!("set_len({size}) failed: {e}");
+        while file.set_len(size).is_err() {
             size /= 2;
             assert!(size >= 64 * (1 << 30), "volume refuses a useful size");
         }
@@ -1192,7 +1185,6 @@ mod tests {
             on_disk < 1 << 20,
             "{on_disk} bytes allocated, expected none"
         );
-        eprintln!("sparse file: {size} bytes logical, {on_disk} on disk");
         size
     }
 
@@ -1205,7 +1197,6 @@ mod tests {
         let logical = sparse_file(&f, 4 * TIB);
         let before = bin_info().unwrap();
         let r = del(&[t(&f)], DeleteMode::RecycleBin, &ctx());
-        eprintln!("oversized file: {r:?}");
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert!(r.removed.is_empty() && r.recycled.is_empty());
@@ -1238,10 +1229,6 @@ mod tests {
 
         let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
 
-        eprintln!(
-            "oversized file in a folder: {r:?}, bin {before:?} to {:?}",
-            bin_info().unwrap()
-        );
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
         assert_eq!(fs::metadata(&f).unwrap().len(), logical);
@@ -1269,10 +1256,6 @@ mod tests {
 
         let outcome = recycle_with_unknown_quota(&f);
 
-        eprintln!(
-            "guard on an oversized file: {outcome:?}, bin {before:?} to {:?}",
-            bin_info().unwrap()
-        );
         assert_eq!(outcome, Err(FailReason::NotRecyclable));
         assert!(
             RESTORED.lock().unwrap().contains(&f),
@@ -1302,7 +1285,6 @@ mod tests {
 
         let outcome = recycle_with_unknown_quota(&f);
 
-        eprintln!("guard on a file with two names: {outcome:?}");
         assert_eq!(outcome, Err(FailReason::NotRecyclable));
         assert!(
             RESTORED.lock().unwrap().contains(&f),
