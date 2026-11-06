@@ -1,13 +1,20 @@
+use std::ffi::c_void;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, Prefix};
+use std::time::{Duration, SystemTime};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleW, GetLongPathNameW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
+    CreateFileW, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
+    FindNextFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW, GetLongPathNameW, BY_HANDLE_FILE_INFORMATION,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FIND_FIRST_EX_LARGE_FETCH, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
+    WIN32_FIND_DATAW,
 };
 
 fn to_wide(s: &OsStr) -> Vec<u16> {
@@ -116,6 +123,138 @@ pub(crate) fn final_path_name(p: &Path) -> Option<String> {
     path.map(without_verbatim_prefix)
 }
 
+/// One directory entry, without `.` and `..`.
+pub struct DirEntry {
+    pub name: String,
+    pub attrs: u32,
+    /// Reparse tag; only meaningful when `attrs` has the reparse point bit.
+    pub reparse_tag: u32,
+    pub modified: Option<SystemTime>,
+}
+
+fn filetime_to_system(ft: FILETIME) -> Option<SystemTime> {
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    let since_unix = ticks.checked_sub(UNIX_EPOCH_TICKS)?;
+    let nanos = since_unix % 10_000_000 * 100;
+    Some(SystemTime::UNIX_EPOCH + Duration::new(since_unix / 10_000_000, nanos as u32))
+}
+
+fn wide_without_nul(p: &Path) -> Vec<u16> {
+    let mut wide = to_long_path(p);
+    wide.pop();
+    wide
+}
+
+/// Lists a directory with `FindFirstFileExW`. Names are read from the directory
+/// itself, nothing is opened, so cloud placeholders are not hydrated.
+pub fn list_dir(p: &Path) -> io::Result<Vec<DirEntry>> {
+    let mut pattern = wide_without_nul(p);
+    const SEP: u16 = b'\\' as u16;
+    if pattern.last() != Some(&SEP) {
+        pattern.push(SEP);
+    }
+    pattern.push(b'*' as u16);
+    pattern.push(0);
+
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe {
+        FindFirstFileExW(
+            PCWSTR(pattern.as_ptr()),
+            FindExInfoBasic,
+            &mut data as *mut _ as *mut c_void,
+            FindExSearchNameMatch,
+            None,
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    }
+    .map_err(io::Error::from)?;
+
+    let mut out = Vec::new();
+    let result = loop {
+        let len = data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(data.cFileName.len());
+        let name = &data.cFileName[..len];
+        if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+            out.push(DirEntry {
+                name: String::from_utf16_lossy(name),
+                attrs: data.dwFileAttributes,
+                reparse_tag: data.dwReserved0,
+                modified: filetime_to_system(data.ftLastWriteTime),
+            });
+        }
+        match unsafe { FindNextFileW(handle, &mut data) } {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_NO_MORE_FILES.to_hresult() => break Ok(()),
+            Err(e) => break Err(io::Error::from(e)),
+        }
+    };
+    let _ = unsafe { FindClose(handle) };
+    result.map(|()| out)
+}
+
+/// Size on disk as reported by `GetCompressedFileSizeW`: the compressed size for
+/// compressed or sparse files, the plain length otherwise.
+pub fn allocated_size(p: &Path) -> io::Result<u64> {
+    let wide = to_long_path(p);
+    let mut high = 0u32;
+    let low = unsafe { GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high)) };
+    if low == u32::MAX {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(0) {
+            return Err(err);
+        }
+    }
+    Ok((u64::from(high) << 32) | u64::from(low))
+}
+
+/// `(volume serial, file id, link count)`. Opens with `FILE_READ_ATTRIBUTES`
+/// only and without following reparse points, so nothing is recalled from the cloud.
+pub fn link_info(p: &Path) -> io::Result<(u64, u64, u32)> {
+    let wide = to_long_path(p);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(io::Error::from)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(io::Error::from);
+    let _ = unsafe { CloseHandle(handle) };
+    result?;
+    let id = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        id,
+        info.nNumberOfLinks,
+    ))
+}
+
+/// `(total bytes, free bytes available to the caller)` of the volume holding `p`.
+pub fn volume_space(p: &Path) -> io::Result<(u64, u64)> {
+    let wide = to_long_path(p);
+    let (mut free, mut total) = (0u64, 0u64);
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut free),
+            Some(&mut total),
+            None,
+        )
+    }
+    .map_err(io::Error::from)?;
+    Ok((total, free))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +294,40 @@ mod tests {
         assert_eq!(long(r"a\b"), r"a\b");
         assert_eq!(long(r"C:a"), r"C:a");
         assert_eq!(long(r"\a"), r"\a");
+    }
+
+    #[test]
+    fn list_dir_skips_dot_entries_and_reports_attrs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let mut entries = list_dir(dir.path()).unwrap();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["d", "f"]);
+        assert_ne!(entries[0].attrs & 0x10, 0);
+        assert_eq!(entries[1].attrs & 0x10, 0);
+        assert!(entries[1].modified.is_some());
+        assert!(list_dir(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn size_link_and_volume_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"hello").unwrap();
+        assert_eq!(allocated_size(&file).unwrap(), 5);
+        assert_eq!(link_info(&file).unwrap().2, 1);
+        std::fs::hard_link(&file, dir.path().join("g")).unwrap();
+        let (vol, id, links) = link_info(&file).unwrap();
+        assert_eq!(links, 2);
+        assert_eq!(
+            (vol, id),
+            link_info(&dir.path().join("g"))
+                .map(|i| (i.0, i.1))
+                .unwrap()
+        );
+        let (total, free) = volume_space(dir.path()).unwrap();
+        assert!(total > 0 && free <= total);
     }
 }
