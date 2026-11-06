@@ -568,16 +568,21 @@ pub struct HomeState {
     epoch: u64,
 }
 
+/// Reads the installed apps and browser profiles in a job.
+fn spawn_marks(ctx: &egui::Context, protect: &ProtectContext) -> Job<UsageMarks> {
+    let protect = protect.clone();
+    Job::spawn(ctx.clone(), move || {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+        let roots = browser_profile_roots(local.as_deref(), roaming.as_deref());
+        UsageMarks::with_context(&list_installed(), roots, &protect)
+    })
+}
+
 impl HomeState {
     pub fn new(ctx: &egui::Context, protect: &ProtectContext) -> Self {
         let drive = system_drive_root();
-        let protect = protect.clone();
-        let marks_job = Job::spawn(ctx.clone(), move || {
-            let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-            let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
-            let roots = browser_profile_roots(local.as_deref(), roaming.as_deref());
-            UsageMarks::with_context(&list_installed(), roots, &protect)
-        });
+        let marks_job = spawn_marks(ctx, protect);
         let mut state = HomeState {
             space_root: PathBuf::from(&drive),
             drive,
@@ -602,6 +607,17 @@ impl HomeState {
         };
         state.refresh_space(ctx);
         state
+    }
+
+    /// Reads the installed apps again, after one was removed. Until it is in, rows get
+    /// no tick, and what was worked out from the old marks is dropped.
+    pub fn refresh_marks(&mut self, ctx: &egui::Context, protect: &ProtectContext) {
+        self.marks = None;
+        self.marks_failed = false;
+        self.marks_job = Some(spawn_marks(ctx, protect));
+        self.view = None;
+        self.selection.clear();
+        self.generation += 1;
     }
 
     /// Asks again how much of the shown volume is free.

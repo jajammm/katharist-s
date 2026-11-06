@@ -1,3 +1,4 @@
+pub mod apps;
 pub mod clean;
 pub mod dupes;
 pub mod filelist;

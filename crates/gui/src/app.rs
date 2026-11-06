@@ -11,6 +11,7 @@ use katharistis_core::win;
 use crate::confirm::{self, ConfirmContext, ConfirmRequest, DeleteFlow, Guards};
 use crate::i18n::{self, l};
 use crate::jobs::Job;
+use crate::views::apps::{self, AppsState};
 use crate::views::clean::{self, CleanState};
 use crate::views::dupes::{self, DupesState};
 use crate::views::home::{self, HomeAction, HomeState};
@@ -53,6 +54,7 @@ pub struct App {
     /// Reports whose tree update waits for a job to let go of the tree: `(epoch, report)`.
     pending_reports: Vec<(u64, katharistis_core::delete::DeleteReport)>,
     clean: CleanState,
+    apps: AppsState,
     large: LargeState,
     stale: StaleState,
     dupes: DupesState,
@@ -82,6 +84,7 @@ impl App {
             flow_guards: Vec::new(),
             pending_reports: Vec::new(),
             clean: CleanState::default(),
+            apps: AppsState::default(),
             large: LargeState::default(),
             stale: StaleState::default(),
             dupes: DupesState::default(),
@@ -128,6 +131,9 @@ impl App {
             &self.flow_guards,
         ) {
             self.dupes.after_report(&report);
+            if self.flow_context == ConfirmContext::Leftovers {
+                self.apps.after_report(&report);
+            }
             self.pending_reports.push((self.home.epoch(), report));
         }
         self.apply_pending(ctx);
@@ -264,12 +270,6 @@ impl App {
             }
         });
     }
-
-    fn placeholder(ui: &mut egui::Ui, title: &str) {
-        ui.heading(title);
-        ui.add_space(8.0);
-        ui.weak(l("Coming soon.", "Segera hadir."));
-    }
 }
 
 fn system_drive() -> Option<(String, u64, u64)> {
@@ -290,6 +290,10 @@ impl eframe::App for App {
         }
         self.poll_drive();
         self.clean.poll();
+        self.apps.poll(&ctx);
+        if self.apps.take_marks_dirty() {
+            self.home.refresh_marks(&ctx, &self.protect);
+        }
         egui::Panel::left("nav")
             .exact_size(210.0)
             .resizable(false)
@@ -325,7 +329,12 @@ impl eframe::App for App {
                             self.start_flow(request);
                         }
                     }
-                    Tool::Apps => Self::placeholder(ui, l("Apps", "Aplikasi")),
+                    Tool::Apps => {
+                        let busy = !self.flow.is_idle();
+                        if let Some(request) = apps::show(ui, &mut self.apps, busy) {
+                            self.start_flow(request);
+                        }
+                    }
                     Tool::Large => {
                         let action = large::show(
                             ui,

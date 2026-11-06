@@ -84,12 +84,10 @@ fn guarded_delete(
     report
 }
 
-// `Leftovers` is raised by the screen of task 16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfirmContext {
     User,
     Cleanup,
-    #[allow(dead_code)]
     Leftovers,
     Duplicates,
 }
