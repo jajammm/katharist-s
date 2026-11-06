@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::win;
@@ -37,21 +38,22 @@ pub struct ProtectContext {
 }
 
 impl ProtectContext {
-    /// Reads the locations from the environment. A missing or relative variable
-    /// falls back to the standard location, so a stripped environment cannot
-    /// leave the system folders unprotected.
+    /// Reads the locations from the environment. A variable that is missing or
+    /// has no canonical key falls back to the standard location, so a bad
+    /// environment cannot leave the system folders unprotected.
     pub fn from_env() -> Self {
-        let var = |name: &str| {
-            env::var_os(name)
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-        };
-        let system_root = env::var_os("SystemDrive")
+        Self::from_vars(|name| env::var_os(name), env::current_exe().ok())
+    }
+
+    fn from_vars(lookup: impl Fn(&str) -> Option<OsString>, exe: Option<PathBuf>) -> Self {
+        let usable = |p: &PathBuf| canonical_key(p).is_some();
+        let var = |name: &str| lookup(name).map(PathBuf::from).filter(usable);
+        let system_root = lookup("SystemDrive")
             .map(|mut drive| {
                 drive.push(r"\");
                 PathBuf::from(drive)
             })
-            .filter(|p| p.is_absolute())
+            .filter(usable)
             .unwrap_or_else(|| PathBuf::from(r"C:\"));
 
         let windows_dir = var("SystemRoot")
@@ -71,7 +73,7 @@ impl ProtectContext {
 
         let program_data = var("ProgramData").unwrap_or_else(|| system_root.join("ProgramData"));
         let profile = var("USERPROFILE").unwrap_or_else(|| {
-            let name = env::var_os("USERNAME").unwrap_or_default();
+            let name = lookup("USERNAME").unwrap_or_default();
             system_root.join("Users").join(name)
         });
         // %PUBLIC% first: the profile's parent is wrong for service accounts,
@@ -87,7 +89,7 @@ impl ProtectContext {
         let mut own_dirs = vec![app_data.join("Katharistis")];
         // The exe itself, not its folder: running from Downloads must not make
         // the rest of Downloads undeletable.
-        own_dirs.extend(env::current_exe());
+        own_dirs.extend(exe);
 
         ProtectContext {
             windows_dir,
@@ -276,10 +278,44 @@ fn violates_root_rules(key: &str) -> bool {
     first.is_empty() || VOLUME_ROOT_ITEMS.contains(&first)
 }
 
+/// Whether `key` is a direct child of the users folder, or a standard folder or
+/// secret folder inside one. Each user's profile gets the same rules as
+/// `ProtectContext::profile`, and the contents of standard folders stay deletable.
+fn matches_user_profile_rules(key: &str, users_dir: &str) -> bool {
+    let Some(rest) = key
+        .strip_prefix(users_dir.trim_end_matches('\\'))
+        .and_then(|rest| rest.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    let inside = rest.split_once('\\').map_or("", |(_user, inside)| inside);
+    inside.is_empty()
+        || PROFILE_FOLDERS
+            .iter()
+            .any(|folder| inside.eq_ignore_ascii_case(folder))
+        || PROFILE_SECRETS
+            .iter()
+            .any(|secret| is_at_or_under(inside, secret))
+}
+
 /// The safety gate for deletion. Fails closed: a path that cannot be pinned to a
-/// location is protected. The checked path counts under each spelling it could
-/// be reached by, including with reparse points in its parents followed.
+/// location is protected, and so is everything if a context entry cannot be,
+/// since its rule could not be applied. The checked path counts under each
+/// spelling it could be reached by, including with reparse points in its parents
+/// followed.
 pub fn is_protected(p: &Path, ctx: &ProtectContext) -> bool {
+    let mut locations = vec![
+        ctx.windows_dir.clone(),
+        ctx.program_data.clone(),
+        ctx.users_dir.clone(),
+        ctx.profile.clone(),
+    ];
+    locations.extend(ctx.program_files.iter().cloned());
+    locations.extend(ctx.own_dirs.iter().cloned());
+    if locations.iter().any(|entry| canonical_key(entry).is_none()) {
+        return true;
+    }
+
     let Some(key) = canonical_key(p) else {
         return true;
     };
@@ -307,6 +343,15 @@ pub fn is_protected(p: &Path, ctx: &ProtectContext) -> bool {
         return true;
     }
 
+    let users_dirs = entry_keys(&ctx.users_dir);
+    if keys.iter().any(|key| {
+        users_dirs
+            .iter()
+            .any(|users_dir| matches_user_profile_rules(key, users_dir))
+    }) {
+        return true;
+    }
+
     let mut subtree = vec![ctx.windows_dir.clone()];
     subtree.extend(ctx.program_files.iter().cloned());
     subtree.extend(PROFILE_SECRETS.iter().map(|name| ctx.profile.join(name)));
@@ -321,15 +366,10 @@ pub fn is_protected(p: &Path, ctx: &ProtectContext) -> bool {
 
     // Deleting a folder deletes what is in it, so the chain leading up to each
     // location is protected too. Siblings along that chain stay deletable.
-    let mut chained = vec![
-        ctx.windows_dir.clone(),
-        ctx.program_data.clone(),
-        ctx.users_dir.clone(),
-        ctx.profile.clone(),
-    ];
-    chained.extend(ctx.program_files.iter().cloned());
-    chained.extend(ctx.own_dirs.iter().cloned());
-    let chained: Vec<String> = chained.iter().flat_map(|entry| entry_keys(entry)).collect();
+    let chained: Vec<String> = locations
+        .iter()
+        .flat_map(|entry| entry_keys(entry))
+        .collect();
     keys.iter()
         .any(|key| chained.iter().any(|entry| is_at_or_under(entry, key)))
 }
@@ -448,6 +488,192 @@ mod tests {
         ] {
             assert!(!is_protected(Path::new(p), &c), "{p}");
         }
+    }
+
+    #[test]
+    fn an_unusable_context_entry_protects_everything() {
+        let probes = [r"C:\Windows\x", r"D:\Games\old"];
+        let bad_values = ["", "relative", r"\\.\C:\Windows", r"C:\Windows:s"];
+        for bad in bad_values {
+            let bad = PathBuf::from(bad);
+            let contexts = [
+                ProtectContext {
+                    windows_dir: bad.clone(),
+                    ..ctx()
+                },
+                ProtectContext {
+                    program_files: vec![r"C:\Program Files".into(), bad.clone()],
+                    ..ctx()
+                },
+                ProtectContext {
+                    program_data: bad.clone(),
+                    ..ctx()
+                },
+                ProtectContext {
+                    users_dir: bad.clone(),
+                    ..ctx()
+                },
+                ProtectContext {
+                    profile: bad.clone(),
+                    ..ctx()
+                },
+                ProtectContext {
+                    own_dirs: vec![r"C:\Users\me\own".into(), bad.clone()],
+                    ..ctx()
+                },
+            ];
+            for (field, c) in contexts.iter().enumerate() {
+                for p in probes {
+                    assert!(is_protected(Path::new(p), c), "field {field}, {bad:?}, {p}");
+                }
+            }
+        }
+    }
+
+    fn ctx_from_vars(vars: &[(&str, &str)]) -> ProtectContext {
+        ProtectContext::from_vars(
+            |name| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.into())
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn from_vars_uses_values_that_canonicalize() {
+        let c = ctx_from_vars(&[
+            ("SystemRoot", r"E:\Win"),
+            ("ProgramFiles", r"E:\PF"),
+            ("ProgramW6432", r"E:\PF"),
+            ("ProgramFiles(x86)", r"E:\PF86"),
+            ("ProgramData", r"E:\PD"),
+            ("USERPROFILE", r"E:\Home\me"),
+            ("PUBLIC", r"F:\People\Public"),
+            ("APPDATA", r"E:\Roam"),
+        ]);
+        assert_eq!(c.windows_dir, Path::new(r"E:\Win"));
+        assert_eq!(
+            c.program_files,
+            [PathBuf::from(r"E:\PF"), PathBuf::from(r"E:\PF86")]
+        );
+        assert_eq!(c.program_data, Path::new(r"E:\PD"));
+        assert_eq!(c.profile, Path::new(r"E:\Home\me"));
+        assert_eq!(c.users_dir, Path::new(r"F:\People"));
+        assert_eq!(c.own_dirs, [PathBuf::from(r"E:\Roam\Katharistis")]);
+    }
+
+    #[test]
+    fn from_vars_sends_values_that_do_not_canonicalize_to_the_fallback() {
+        for bad in [
+            "",
+            "relative",
+            r"\Windows",
+            r"\\.\C:\Windows",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Windows",
+            r"C:\Windows:s",
+            r"C:\...\Windows",
+        ] {
+            let c = ctx_from_vars(&[
+                ("SystemDrive", bad),
+                ("SystemRoot", bad),
+                ("windir", bad),
+                ("ProgramFiles", bad),
+                ("ProgramFiles(x86)", bad),
+                ("ProgramW6432", bad),
+                ("ProgramData", bad),
+                ("USERPROFILE", bad),
+                ("USERNAME", "me"),
+                ("PUBLIC", bad),
+                ("APPDATA", bad),
+            ]);
+            assert_eq!(c.windows_dir, Path::new(r"C:\Windows"), "{bad}");
+            assert_eq!(
+                c.program_files,
+                [
+                    PathBuf::from(r"C:\Program Files"),
+                    PathBuf::from(r"C:\Program Files (x86)")
+                ],
+                "{bad}"
+            );
+            assert_eq!(c.program_data, Path::new(r"C:\ProgramData"), "{bad}");
+            assert_eq!(c.profile, Path::new(r"C:\Users\me"), "{bad}");
+            assert_eq!(c.users_dir, Path::new(r"C:\Users"), "{bad}");
+            assert_eq!(
+                c.own_dirs,
+                [PathBuf::from(r"C:\Users\me\AppData\Roaming\Katharistis")],
+                "{bad}"
+            );
+            assert!(is_protected(Path::new(r"C:\Windows\x"), &c), "{bad}");
+            assert!(!is_protected(Path::new(r"D:\Games\old"), &c), "{bad}");
+        }
+    }
+
+    #[test]
+    fn from_vars_tries_windir_before_the_default_and_honours_system_drive() {
+        let c = ctx_from_vars(&[("SystemRoot", r"\\.\C:\Windows"), ("windir", r"E:\Win")]);
+        assert_eq!(c.windows_dir, Path::new(r"E:\Win"));
+        let c = ctx_from_vars(&[("SystemDrive", "E:")]);
+        assert_eq!(c.windows_dir, Path::new(r"E:\Windows"));
+        assert_eq!(c.program_data, Path::new(r"E:\ProgramData"));
+    }
+
+    #[test]
+    fn other_users_get_the_same_rules_as_the_profile() {
+        let c = ctx();
+        for p in [
+            r"C:\Users\other",
+            r"C:\Users\Public",
+            r"C:\Users\other\Documents",
+            r"C:\Users\other\Desktop",
+            r"C:\Users\other\Downloads",
+            r"C:\Users\other\Pictures",
+            r"C:\Users\other\Music",
+            r"C:\Users\other\Videos",
+            r"C:\Users\other\AppData",
+            r"C:\Users\other\AppData\Local",
+            r"C:\Users\other\AppData\Roaming",
+            r"C:\Users\other\.ssh",
+            r"C:\Users\other\.ssh\id_rsa",
+            r"C:\Users\other\.gnupg\key",
+            r"c:/users/OTHER/DOCUMENTS",
+            r"C:\Users\other\Documents.",
+            r"\\?\C:\Users\other\x\..\.ssh\id_rsa",
+        ] {
+            assert!(is_protected(Path::new(p), &c), "{p}");
+        }
+        for p in [
+            r"C:\Users\other\Documents\a.txt",
+            r"C:\Users\other\stuff",
+            r"C:\Users\other\stuff\Documents",
+            r"C:\Users\other\AppData\Local\Temp\x",
+            r"C:\Users\other\AppData\Roaming\Vendor",
+            r"C:\Users\other\.sshx",
+            r"C:\Users\other\DocumentsOld",
+        ] {
+            assert!(!is_protected(Path::new(p), &c), "{p}");
+        }
+    }
+
+    #[test]
+    fn other_user_rules_follow_a_relocated_users_dir() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(r"real\bob\Documents")).unwrap();
+        junction(&root.join("alias"), &root.join("real"));
+        let c = ProtectContext {
+            users_dir: root.join("alias"),
+            ..ctx()
+        };
+        assert!(is_protected(&root.join(r"real\bob"), &c));
+        assert!(is_protected(&root.join(r"alias\bob\Documents"), &c));
+        assert!(is_protected(
+            &canonical_for_delete(&root.join(r"alias\bob\.ssh\id_rsa")).unwrap(),
+            &c
+        ));
+        assert!(!is_protected(&root.join(r"real\bob\Documents\a.txt"), &c));
+        assert!(!is_protected(&root.join(r"real\bob\stuff"), &c));
     }
 
     #[test]
