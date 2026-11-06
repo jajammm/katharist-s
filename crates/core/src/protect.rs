@@ -312,8 +312,26 @@ pub fn is_protected(p: &Path, ctx: &ProtectContext) -> bool {
     subtree.extend(PROFILE_SECRETS.iter().map(|name| ctx.profile.join(name)));
     subtree.extend(ctx.own_dirs.iter().cloned());
     let subtree: Vec<String> = subtree.iter().flat_map(|entry| entry_keys(entry)).collect();
-    keys.iter()
+    if keys
+        .iter()
         .any(|key| subtree.iter().any(|base| is_at_or_under(key, base)))
+    {
+        return true;
+    }
+
+    // Deleting a folder deletes what is in it, so the chain leading up to each
+    // location is protected too. Siblings along that chain stay deletable.
+    let mut chained = vec![
+        ctx.windows_dir.clone(),
+        ctx.program_data.clone(),
+        ctx.users_dir.clone(),
+        ctx.profile.clone(),
+    ];
+    chained.extend(ctx.program_files.iter().cloned());
+    chained.extend(ctx.own_dirs.iter().cloned());
+    let chained: Vec<String> = chained.iter().flat_map(|entry| entry_keys(entry)).collect();
+    keys.iter()
+        .any(|key| chained.iter().any(|entry| is_at_or_under(entry, key)))
 }
 
 #[cfg(test)]
@@ -430,6 +448,97 @@ mod tests {
         ] {
             assert!(!is_protected(Path::new(p), &c), "{p}");
         }
+    }
+
+    #[test]
+    fn relocated_profile_protects_its_parent_but_not_lookalikes() {
+        let c = ProtectContext {
+            profile: r"D:\Profiles\me".into(),
+            ..ctx()
+        };
+        for p in [
+            r"D:\Profiles",
+            r"D:\Profiles\",
+            r"d:/PROFILES",
+            r"D:\Profiles.",
+            r"D:\Profiles\me",
+        ] {
+            assert!(is_protected(Path::new(p), &c), "{p}");
+        }
+        for p in [
+            r"D:\Profiles2",
+            r"D:\Prof",
+            r"D:\Profiles\other",
+            r"D:\Other",
+        ] {
+            assert!(!is_protected(Path::new(p), &c), "{p}");
+        }
+    }
+
+    #[test]
+    fn exe_under_downloads_protects_only_the_chain_up_to_it() {
+        let c = ctx_owning(Path::new(r"C:\Users\me\Downloads\tool\k.exe"));
+        for p in [
+            r"C:\Users\me\Downloads\tool",
+            r"C:\Users\me\Downloads\tool\k.exe",
+        ] {
+            assert!(is_protected(Path::new(p), &c), "{p}");
+        }
+        for p in [
+            r"C:\Users\me\Downloads\other",
+            r"C:\Users\me\Downloads\tool2",
+            r"C:\Users\me\Downloads\tool\other.txt",
+            r"C:\Users\me\Downloads\tool\k.exe.bak",
+        ] {
+            assert!(!is_protected(Path::new(p), &c), "{p}");
+        }
+    }
+
+    #[test]
+    fn every_ancestor_of_every_context_location_is_protected() {
+        let c = ProtectContext {
+            windows_dir: r"E:\a\b\Windows".into(),
+            program_files: vec![r"F:\c\PF1".into(), r"F:\d\PF2".into()],
+            program_data: r"G:\e\Data".into(),
+            users_dir: r"H:\f\Users".into(),
+            profile: r"I:\g\me".into(),
+            own_dirs: vec![r"J:\h\own".into(), r"K:\i\k.exe".into()],
+        };
+        for p in [
+            r"E:\a", r"E:\a\b", r"F:\c", r"F:\d", r"G:\e", r"H:\f", r"I:\g", r"J:\h", r"K:\i",
+        ] {
+            assert!(is_protected(Path::new(p), &c), "{p}");
+        }
+        for p in [
+            r"E:\a\other",
+            r"E:\a\b\other",
+            r"E:\ab",
+            r"F:\c\other",
+            r"G:\e\other",
+            r"H:\f\other",
+            r"I:\g\other",
+            r"J:\h\other",
+            r"K:\i\other",
+        ] {
+            assert!(!is_protected(Path::new(p), &c), "{p}");
+        }
+    }
+
+    #[test]
+    fn ancestors_are_seen_through_a_junction() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(r"real\sub\own")).unwrap();
+        fs::create_dir(root.join(r"real\other")).unwrap();
+        junction(&root.join("alias"), &root.join("real"));
+        let c = ctx_owning(&root.join(r"alias\sub\own"));
+        assert!(is_protected(&root.join("real"), &c));
+        assert!(is_protected(&root.join(r"real\sub"), &c));
+        assert!(is_protected(
+            &canonical_for_delete(&root.join(r"alias\sub")).unwrap(),
+            &c
+        ));
+        assert!(!is_protected(&root.join(r"real\other"), &c));
     }
 
     #[test]
@@ -778,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn from_env_protects_the_exe_file_but_not_its_folder() {
+    fn from_env_protects_the_exe_and_the_chain_to_it_but_not_siblings() {
         let c = ProtectContext::from_env();
         let exe = std::env::current_exe().unwrap();
         assert!(c.own_dirs.contains(&exe));
@@ -786,7 +895,11 @@ mod tests {
         assert!(c.own_dirs.iter().any(|d| d.ends_with("Katharistis")));
         assert!(is_protected(&exe, &c));
         assert!(!is_protected(&exe.with_file_name("not-the-exe.txt"), &c));
-        assert!(!is_protected(exe.parent().unwrap(), &c));
+        assert!(is_protected(exe.parent().unwrap(), &c));
+        assert!(!is_protected(
+            &exe.parent().unwrap().with_file_name("not-the-exe-folder"),
+            &c
+        ));
     }
 
     #[test]
