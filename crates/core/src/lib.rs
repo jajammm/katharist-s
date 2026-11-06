@@ -8,5 +8,6 @@ pub mod other_space;
 pub mod protect;
 pub mod recycle;
 pub mod scan;
+pub mod settings;
 pub mod treemap;
 pub mod win;
