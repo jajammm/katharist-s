@@ -308,6 +308,7 @@ pub fn request_from_selection(
             .collect(),
         mode,
         context: ConfirmContext::User,
+        empty_bin: None,
     }
 }
 

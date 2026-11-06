@@ -7,9 +7,10 @@ use katharistis_core::scan::ScanTree;
 use katharistis_core::settings::{self, Settings, Theme};
 use katharistis_core::win;
 
-use crate::confirm::{self, DeleteFlow};
+use crate::confirm::{self, ConfirmContext, ConfirmRequest, DeleteFlow};
 use crate::i18n::{self, l};
 use crate::jobs::Job;
+use crate::views::clean::{self, CleanState};
 use crate::views::home::{self, HomeAction, HomeState};
 use crate::{theme, views};
 
@@ -38,6 +39,9 @@ pub struct App {
     protect: ProtectContext,
     home: HomeState,
     flow: DeleteFlow,
+    /// The context of the request that started `flow`, which the report depends on.
+    flow_context: ConfirmContext,
+    clean: CleanState,
     /// A close was refused and the job it waited for is still running.
     close_refused: bool,
 }
@@ -60,6 +64,8 @@ impl App {
             protect,
             home,
             flow: DeleteFlow::Idle,
+            flow_context: ConfirmContext::User,
+            clean: CleanState::default(),
             close_refused: false,
         };
         app.apply_language();
@@ -78,11 +84,15 @@ impl App {
                 let excluded = self.excluded();
                 self.home.start_scan(ctx, root, excluded, &mut self.tree);
             }
-            HomeAction::Delete(request) => {
-                if self.flow.is_idle() {
-                    self.flow = DeleteFlow::Confirm(request);
-                }
-            }
+            HomeAction::Delete(request) => self.start_flow(request),
+        }
+    }
+
+    /// Opens the confirmation. Only one flow runs at a time.
+    fn start_flow(&mut self, request: ConfirmRequest) {
+        if self.flow.is_idle() {
+            self.flow_context = request.context;
+            self.flow = DeleteFlow::Confirm(request);
         }
     }
 
@@ -90,7 +100,9 @@ impl App {
     /// line with what it did.
     fn run_flow(&mut self, ctx: &egui::Context) {
         let was_working = self.flow.is_working();
-        if let Some(report) = confirm::show_flow(ctx, &mut self.flow, &self.protect) {
+        if let Some(report) =
+            confirm::show_flow(ctx, &mut self.flow, &self.protect, self.flow_context)
+        {
             if let Some(tree) = &mut self.tree {
                 self.home.after_report(tree, &report);
             }
@@ -101,6 +113,9 @@ impl App {
         if was_working && !self.flow.is_working() {
             self.home.refresh_space(ctx);
             self.drive_job = Some(Job::spawn(ctx.clone(), system_drive));
+            if self.flow_context == ConfirmContext::Cleanup {
+                self.clean.start_scan(ctx);
+            }
         }
         self.guard_close(ctx);
     }
@@ -222,6 +237,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.home.poll(&ctx, &mut self.tree);
         self.poll_drive();
+        self.clean.poll();
         egui::Panel::left("nav")
             .exact_size(210.0)
             .resizable(false)
@@ -251,7 +267,12 @@ impl eframe::App for App {
                             self.handle_home(&ctx, action);
                         }
                     }
-                    Tool::Clean => Self::placeholder(ui, l("Cleanup", "Pembersihan")),
+                    Tool::Clean => {
+                        let busy = !self.flow.is_idle();
+                        if let Some(request) = clean::show(ui, &mut self.clean, busy) {
+                            self.start_flow(request);
+                        }
+                    }
                     Tool::Apps => Self::placeholder(ui, l("Apps", "Aplikasi")),
                     Tool::Large => Self::placeholder(ui, l("Largest", "Terbesar")),
                     Tool::Stale => {

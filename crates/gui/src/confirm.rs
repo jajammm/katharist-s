@@ -19,15 +19,19 @@ pub struct ConfirmRequest {
     pub mode: DeleteMode,
     pub warn_app_owned: usize,
     pub context: ConfirmContext,
+    /// `Some(size)` when the same confirmation also empties the Recycle Bin, which
+    /// held `size` bytes when it was read. Raised only by the cleanup screen.
+    pub empty_bin: Option<u64>,
 }
 
-/// `Cleanup`, `Leftovers` and `Duplicates` are raised by the screens of tasks 14 to 16.
-#[allow(dead_code)]
+/// `Leftovers` and `Duplicates` are raised by the screens of tasks 15 and 16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfirmContext {
     User,
     Cleanup,
+    #[allow(dead_code)]
     Leftovers,
+    #[allow(dead_code)]
     Duplicates,
 }
 
@@ -38,6 +42,7 @@ pub struct ConfirmSummary {
     pub permanent: bool,
     pub says_not_in_bin: bool,
     pub app_owned: usize,
+    pub empty_bin: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +61,33 @@ pub fn confirm_summary(req: &ConfirmRequest) -> ConfirmSummary {
         permanent,
         says_not_in_bin: permanent,
         app_owned: req.warn_app_owned,
+        empty_bin: req.empty_bin,
     }
+}
+
+/// What a report counts under "Not done" and what it sets apart as skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportGroups {
+    pub skipped_in_use: usize,
+    pub not_done: usize,
+}
+
+/// A cleanup treats an item in use as skipped, since caches and temp files are often
+/// held open. Every other context keeps it among the failures.
+fn is_skipped(f: &delete::Failed, context: ConfirmContext) -> bool {
+    context == ConfirmContext::Cleanup && f.reason == FailReason::InUse
+}
+
+pub fn report_groups(r: &DeleteReport, context: ConfirmContext) -> ReportGroups {
+    let skipped_in_use = r.failed.iter().filter(|f| is_skipped(f, context)).count();
+    ReportGroups {
+        skipped_in_use,
+        not_done: r.failed.len() - skipped_in_use,
+    }
+}
+
+pub fn skipped_in_use_text() -> &'static str {
+    l("Skipped, in use:", "Dilewati, sedang dipakai:")
 }
 
 pub fn report_summary(r: &DeleteReport) -> ReportSummary {
@@ -169,6 +200,9 @@ pub enum DeleteFlow {
     Report(DeleteReport),
     ConfirmEmptyBin(DeleteReport, BinLoad),
     EmptyingBin(Job<BinEmptied>, DeleteReport),
+    /// A cleanup whose one confirmation named both the items and the bin: the delete,
+    /// then the emptying. What was sent is kept for a panic, which proves nothing.
+    RunningWithBin(Job<(DeleteReport, BinEmptied)>, Vec<Target>),
     Emptied(DeleteReport, BinEmptied),
     /// A delete job panicked. The report holds only what an earlier step proved; the
     /// targets were sent to the job that panicked, so nothing can be said about them.
@@ -184,7 +218,10 @@ impl DeleteFlow {
     pub fn is_working(&self) -> bool {
         matches!(
             self,
-            DeleteFlow::Running(_) | DeleteFlow::RunningPermanent(..) | DeleteFlow::EmptyingBin(..)
+            DeleteFlow::Running(_)
+                | DeleteFlow::RunningPermanent(..)
+                | DeleteFlow::EmptyingBin(..)
+                | DeleteFlow::RunningWithBin(..)
         )
     }
 
@@ -262,6 +299,23 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
             l(
                 "These items do not go to the Recycle Bin, so they cannot be restored from it.",
                 "Item ini tidak masuk Recycle Bin, jadi tidak bisa dipulihkan dari sana.",
+            )
+            .to_string(),
+        );
+    }
+    if let Some(bytes) = s.empty_bin {
+        lines.push(format!(
+            "{} {}",
+            l(
+                "This also empties the Recycle Bin on every drive, including what was in it before. It held:",
+                "Ini juga mengosongkan Recycle Bin di semua drive, termasuk isi yang sudah ada sebelumnya. Isinya:",
+            ),
+            format_size(bytes)
+        ));
+        lines.push(
+            l(
+                "Items in the Recycle Bin cannot be restored afterwards.",
+                "Isi Recycle Bin tidak bisa dipulihkan setelah itu.",
             )
             .to_string(),
         );
@@ -461,7 +515,27 @@ fn poll_flow(flow: &mut DeleteFlow) -> Option<DeleteReport> {
             *flow = DeleteFlow::Emptied(report, result);
             None
         }
+        DeleteFlow::RunningWithBin(job, sent) => match job.poll()? {
+            Err(JobPanicked) => {
+                *flow = DeleteFlow::OutcomeUnknown(DeleteReport::default(), std::mem::take(sent));
+                None
+            }
+            Ok((report, result)) => {
+                *flow = DeleteFlow::Emptied(report.clone(), result);
+                Some(report)
+            }
+        },
         _ => None,
+    }
+}
+
+/// Asks Windows to empty the bin, then reads it back for what is true now.
+fn empty_and_read_back(ops: FlowOps, before: Option<(u64, u64)>) -> BinEmptied {
+    let error = (ops.empty_bin)().err().map(|e| e.to_string());
+    BinEmptied {
+        before,
+        after: (ops.bin_info)().ok(),
+        error,
     }
 }
 
@@ -480,6 +554,37 @@ fn apply_event(
 ) -> Option<DeleteReport> {
     let state = std::mem::replace(flow, DeleteFlow::Idle);
     match (state, event) {
+        (DeleteFlow::Confirm(req), FlowEvent::Confirm)
+            if !req.items.is_empty() && req.empty_bin.is_some() =>
+        {
+            // The confirmation named both, so one press runs the delete and then the
+            // emptying, and the bin is read before and after.
+            let protect = protect.clone();
+            let items = req.items;
+            let mode = req.mode;
+            let sent = items.clone();
+            *flow = DeleteFlow::RunningWithBin(
+                Job::spawn(ctx.clone(), move || {
+                    let before = (ops.bin_info)().ok();
+                    let report = (ops.delete)(&items, mode, &protect);
+                    (report, empty_and_read_back(ops, before))
+                }),
+                sent,
+            );
+            None
+        }
+        (DeleteFlow::Confirm(req), FlowEvent::Confirm)
+            if req.items.is_empty() && req.empty_bin.is_some() =>
+        {
+            *flow = DeleteFlow::RunningWithBin(
+                Job::spawn(ctx.clone(), move || {
+                    let before = (ops.bin_info)().ok();
+                    (DeleteReport::default(), empty_and_read_back(ops, before))
+                }),
+                Vec::new(),
+            );
+            None
+        }
         (DeleteFlow::Confirm(req), FlowEvent::Confirm) if !req.items.is_empty() => {
             let protect = protect.clone();
             *flow = DeleteFlow::Running(Job::spawn(ctx.clone(), move || {
@@ -517,14 +622,7 @@ fn apply_event(
             None
         }
         (DeleteFlow::ConfirmEmptyBin(report, BinLoad::Known(before)), FlowEvent::Confirm) => {
-            let job = Job::spawn(ctx.clone(), move || {
-                let error = (ops.empty_bin)().err().map(|e| e.to_string());
-                BinEmptied {
-                    before,
-                    after: (ops.bin_info)().ok(),
-                    error,
-                }
-            });
+            let job = Job::spawn(ctx.clone(), move || empty_and_read_back(ops, before));
             *flow = DeleteFlow::EmptyingBin(job, report);
             None
         }
@@ -574,7 +672,11 @@ fn render_confirm(ui: &mut egui::Ui, req: &ConfirmRequest) -> Option<FlowEvent> 
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
-        if confirm_button(ui, s.count > 0, mode_text(req.mode)) {
+        if confirm_button(
+            ui,
+            s.count > 0 || s.empty_bin.is_some(),
+            mode_text(req.mode),
+        ) {
             event = Some(FlowEvent::Confirm);
         }
         if ui.button(l("Cancel", "Batal")).clicked() {
@@ -634,7 +736,7 @@ fn render_offer(ui: &mut egui::Ui, offer: &mut PermanentOffer) -> Option<FlowEve
 
 /// The numbers and lists of a report. `in_bin_line` is off once the bin reads as
 /// empty, since those items are no longer there.
-fn report_body(ui: &mut egui::Ui, r: &DeleteReport, in_bin_line: bool) {
+fn report_body(ui: &mut egui::Ui, r: &DeleteReport, in_bin_line: bool, context: ConfirmContext) {
     let s = report_summary(r);
     if in_bin_line {
         ui.label(format!(
@@ -658,12 +760,25 @@ fn report_body(ui: &mut egui::Ui, r: &DeleteReport, in_bin_line: bool) {
             r.removed[i].display().to_string()
         });
     }
-    if s.failed > 0 {
+    let groups = report_groups(r, context);
+    if groups.skipped_in_use > 0 {
+        ui.add_space(6.0);
+        ui.strong(format!(
+            "{} {}",
+            skipped_in_use_text(),
+            groups.skipped_in_use
+        ));
+        let skipped: Vec<_> = r.failed.iter().filter(|f| is_skipped(f, context)).collect();
+        path_list(ui, "report-skipped", skipped.len(), |i| {
+            skipped[i].path.display().to_string()
+        });
+    }
+    if groups.not_done > 0 {
         ui.add_space(6.0);
         ui.strong(format!(
             "{} {}",
             l("Not done:", "Tidak terlaksana:"),
-            s.failed
+            groups.not_done
         ));
         for f in r
             .failed
@@ -675,7 +790,7 @@ fn report_body(ui: &mut egui::Ui, r: &DeleteReport, in_bin_line: bool) {
         let rest: Vec<_> = r
             .failed
             .iter()
-            .filter(|f| !matches!(f.reason, FailReason::GuardKept(_)))
+            .filter(|f| !matches!(f.reason, FailReason::GuardKept(_)) && !is_skipped(f, context))
             .collect();
         path_list(ui, "report-failed", rest.len(), |i| {
             format!(
@@ -702,10 +817,14 @@ fn empty_bin_button(ui: &mut egui::Ui, event: &mut Option<FlowEvent>) {
     }
 }
 
-fn render_report(ui: &mut egui::Ui, r: &DeleteReport) -> Option<FlowEvent> {
+fn render_report(
+    ui: &mut egui::Ui,
+    r: &DeleteReport,
+    context: ConfirmContext,
+) -> Option<FlowEvent> {
     ui.heading(l("Report", "Laporan"));
     ui.add_space(6.0);
-    report_body(ui, r, true);
+    report_body(ui, r, true, context);
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
@@ -753,11 +872,16 @@ fn render_empty_bin(ui: &mut egui::Ui, load: &BinLoad) -> Option<FlowEvent> {
     event
 }
 
-fn render_emptied(ui: &mut egui::Ui, r: &DeleteReport, b: &BinEmptied) -> Option<FlowEvent> {
+fn render_emptied(
+    ui: &mut egui::Ui,
+    r: &DeleteReport,
+    b: &BinEmptied,
+    context: ConfirmContext,
+) -> Option<FlowEvent> {
     ui.heading(l("Report", "Laporan"));
     ui.add_space(6.0);
     ui.label(bin_result_text(b));
-    report_body(ui, r, !b.is_empty_now());
+    report_body(ui, r, !b.is_empty_now(), context);
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
@@ -773,6 +897,7 @@ fn render_unknown(
     ui: &mut egui::Ui,
     proven: &DeleteReport,
     unknown: &[Target],
+    context: ConfirmContext,
 ) -> Option<FlowEvent> {
     ui.heading(l("Outcome unknown", "Hasil tidak diketahui"));
     ui.add_space(6.0);
@@ -794,7 +919,7 @@ fn render_unknown(
             "Known from the step before it:",
             "Yang diketahui dari langkah sebelumnya:",
         ));
-        report_body(ui, proven, true);
+        report_body(ui, proven, true, context);
     }
     ui.add_space(8.0);
     let mut event = None;
@@ -809,7 +934,11 @@ fn render_busy(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-fn render_flow(ctx: &egui::Context, flow: &mut DeleteFlow) -> Option<FlowEvent> {
+fn render_flow(
+    ctx: &egui::Context,
+    flow: &mut DeleteFlow,
+    context: ConfirmContext,
+) -> Option<FlowEvent> {
     if flow.is_idle() {
         return None;
     }
@@ -820,11 +949,15 @@ fn render_flow(ctx: &egui::Context, flow: &mut DeleteFlow) -> Option<FlowEvent> 
             DeleteFlow::Idle => None,
             DeleteFlow::Confirm(req) => render_confirm(ui, req),
             DeleteFlow::ConfirmPermanent(offer, _) => render_offer(ui, offer),
-            DeleteFlow::Report(r) => render_report(ui, r),
+            DeleteFlow::Report(r) => render_report(ui, r, context),
             DeleteFlow::ConfirmEmptyBin(_, load) => render_empty_bin(ui, load),
-            DeleteFlow::Emptied(r, b) => render_emptied(ui, r, b),
-            DeleteFlow::OutcomeUnknown(proven, unknown) => render_unknown(ui, proven, unknown),
-            DeleteFlow::Running(_) | DeleteFlow::RunningPermanent(..) => {
+            DeleteFlow::Emptied(r, b) => render_emptied(ui, r, b, context),
+            DeleteFlow::OutcomeUnknown(proven, unknown) => {
+                render_unknown(ui, proven, unknown, context)
+            }
+            DeleteFlow::Running(_)
+            | DeleteFlow::RunningPermanent(..)
+            | DeleteFlow::RunningWithBin(..) => {
                 render_busy(ui, l("Working...", "Sedang dikerjakan..."));
                 None
             }
@@ -845,28 +978,32 @@ fn drive_flow(
     ctx: &egui::Context,
     flow: &mut DeleteFlow,
     protect: &ProtectContext,
+    context: ConfirmContext,
     ops: FlowOps,
 ) -> Option<DeleteReport> {
     let polled = poll_flow(flow);
-    let applied = render_flow(ctx, flow).and_then(|e| apply_event(ctx, flow, e, protect, ops));
+    let applied =
+        render_flow(ctx, flow, context).and_then(|e| apply_event(ctx, flow, e, protect, ops));
     polled.or(applied)
 }
 
 /// Draws the current step. Returns the report once, when the delete has finished,
 /// so the caller can update its tree. Emptying the bin later returns nothing more.
+/// `context` is the one of the request that started the flow.
 pub fn show_flow(
     ctx: &egui::Context,
     flow: &mut DeleteFlow,
     protect: &ProtectContext,
+    context: ConfirmContext,
 ) -> Option<DeleteReport> {
-    drive_flow(ctx, flow, protect, REAL_OPS)
+    drive_flow(ctx, flow, protect, context, REAL_OPS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use katharistis_core::delete::Failed;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn t(path: &str, size: u64) -> Target {
@@ -890,6 +1027,7 @@ mod tests {
             mode,
             warn_app_owned: 0,
             context,
+            empty_bin: None,
         }
     }
 
@@ -1159,6 +1297,7 @@ mod tests {
             mode: DeleteMode::Permanent,
             warn_app_owned: 0,
             context: ConfirmContext::User,
+            empty_bin: None,
         });
         let ctx = egui::Context::default();
         apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS);
@@ -1442,11 +1581,160 @@ mod tests {
             let before = name(flow);
             for _ in 0..2 {
                 let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    assert!(drive_flow(ui.ctx(), flow, &p, NO_OPS).is_none());
+                    assert!(
+                        drive_flow(ui.ctx(), flow, &p, ConfirmContext::Cleanup, NO_OPS).is_none()
+                    );
                 });
                 out.textures_delta.clear();
             }
             assert_eq!(before, name(flow));
         }
+    }
+
+    /// The two tests that use the counting fakes share their statics.
+    static BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BIN_GONE: AtomicBool = AtomicBool::new(false);
+    fn counting_info() -> io::Result<(u64, u64)> {
+        Ok(if BIN_GONE.load(Ordering::SeqCst) {
+            (0, 0)
+        } else {
+            (500, 4)
+        })
+    }
+    fn counting_empty() -> io::Result<()> {
+        BIN_CALLS.fetch_add(1, Ordering::SeqCst);
+        BIN_GONE.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    const BIN_OPS: FlowOps = FlowOps {
+        delete: delete_all_gone,
+        bin_info: counting_info,
+        empty_bin: counting_empty,
+    };
+
+    fn cleanup_req(items: Vec<Target>, empty_bin: Option<u64>) -> ConfirmRequest {
+        ConfirmRequest {
+            items,
+            mode: DeleteMode::Permanent,
+            warn_app_owned: 0,
+            context: ConfirmContext::Cleanup,
+            empty_bin,
+        }
+    }
+
+    #[test]
+    fn cleanup_confirmation_names_the_bin_emptying_with_its_size() {
+        let with = cleanup_req(vec![t(r"C:\t\a", 10)], Some(2048));
+        let s = confirm_summary(&with);
+        assert_eq!(s.empty_bin, Some(2048));
+        let lines = confirm_lines(&s, ConfirmContext::Cleanup).join("\n");
+        assert!(lines.contains("empties the Recycle Bin"));
+        assert!(lines.contains("2.0 KiB"));
+        let without = cleanup_req(vec![t(r"C:\t\a", 10)], None);
+        let lines = confirm_lines(&confirm_summary(&without), ConfirmContext::Cleanup).join("\n");
+        assert!(!lines.contains("empties the Recycle Bin"));
+    }
+
+    #[test]
+    fn bin_alone_is_emptied_only_after_confirm_and_read_back() {
+        let _serial = BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let p = protect();
+        BIN_CALLS.store(0, Ordering::SeqCst);
+        BIN_GONE.store(false, Ordering::SeqCst);
+        let mut flow = DeleteFlow::Confirm(cleanup_req(Vec::new(), Some(500)));
+        apply_event(&ctx, &mut flow, FlowEvent::Dismiss, &p, BIN_OPS);
+        assert!(flow.is_idle());
+        assert_eq!(BIN_CALLS.load(Ordering::SeqCst), 0);
+
+        let mut flow = DeleteFlow::Confirm(cleanup_req(Vec::new(), Some(500)));
+        assert!(poll_flow(&mut flow).is_none());
+        assert_eq!(BIN_CALLS.load(Ordering::SeqCst), 0);
+        // delete_refused is in NO_OPS: a delete here would panic the job.
+        let ops = FlowOps {
+            delete: delete_refused,
+            ..BIN_OPS
+        };
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &p, ops);
+        assert!(flow.is_working());
+        assert_eq!(settle(&mut flow).len(), 1);
+        let DeleteFlow::Emptied(report, result) = &flow else {
+            panic!("expected the emptied state, nothing deleted");
+        };
+        assert!(report.removed.is_empty());
+        assert_eq!(result.before, Some((500, 4)));
+        assert_eq!(result.after, Some((0, 0)));
+        assert_eq!(BIN_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn items_with_the_bin_delete_then_empty_after_one_confirmation() {
+        let _serial = BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        BIN_CALLS.store(0, Ordering::SeqCst);
+        BIN_GONE.store(false, Ordering::SeqCst);
+        let mut flow = DeleteFlow::Confirm(cleanup_req(vec![t(r"C:\t\a", 10)], Some(500)));
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), BIN_OPS);
+        assert!(flow.is_working());
+        assert!(refuse_close(true, &flow));
+        let reports = settle(&mut flow);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].bytes_freed, 10);
+        let DeleteFlow::Emptied(report, result) = &flow else {
+            panic!("expected the emptied state");
+        };
+        assert_eq!(report.removed, [PathBuf::from(r"C:\t\a")]);
+        assert_eq!(result.before, Some((500, 4)));
+        assert_eq!(result.after, Some((0, 0)));
+        assert_eq!(BIN_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn items_without_the_bin_never_touch_it() {
+        let ctx = egui::Context::default();
+        let mut flow = DeleteFlow::Confirm(cleanup_req(vec![t(r"C:\t\a", 10)], None));
+        let ops = FlowOps {
+            delete: delete_all_gone,
+            ..NO_OPS
+        };
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        assert!(matches!(flow, DeleteFlow::Running(_)));
+        assert_eq!(settle(&mut flow).len(), 1);
+        assert!(matches!(flow, DeleteFlow::Report(_)));
+    }
+
+    #[test]
+    fn a_panic_with_the_bin_is_unknown_and_names_what_was_sent() {
+        let ctx = egui::Context::default();
+        let mut flow = DeleteFlow::Confirm(cleanup_req(vec![t(r"C:\t\a", 10)], Some(500)));
+        let ops = FlowOps {
+            delete: delete_panics,
+            ..NO_OPS
+        };
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), ops);
+        assert!(settle(&mut flow).is_empty());
+        let DeleteFlow::OutcomeUnknown(_, unknown) = &flow else {
+            panic!("expected the unknown outcome");
+        };
+        assert_eq!(unknown.len(), 1);
+    }
+
+    #[test]
+    fn in_use_is_skipped_not_failed_only_for_cleanup() {
+        let r = DeleteReport {
+            failed: vec![
+                fail(r"C:\t\open", 1, FailReason::InUse),
+                fail(r"C:\t\open2", 1, FailReason::InUse),
+                fail(r"C:\t\deny", 1, FailReason::AccessDenied),
+                fail(r"C:\t\g", 1, FailReason::GuardKept(r"C:\t\.g".into())),
+            ],
+            ..Default::default()
+        };
+        let cleanup = report_groups(&r, ConfirmContext::Cleanup);
+        assert_eq!((cleanup.skipped_in_use, cleanup.not_done), (2, 2));
+        let user = report_groups(&r, ConfirmContext::User);
+        assert_eq!((user.skipped_in_use, user.not_done), (0, 4));
+        assert!(skipped_in_use_text().contains("Skipped, in use"));
     }
 }
