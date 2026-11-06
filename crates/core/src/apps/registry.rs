@@ -154,12 +154,22 @@ pub fn list_installed() -> Vec<AppEntry> {
     out
 }
 
-/// Whether a subkey with this name still exists in any of the three locations.
+/// Only a key that is not found is gone. Any other failure, such as access denied,
+/// says nothing about the app, and calling it gone would offer the leftovers of an
+/// app that is still installed.
+fn answers_registered<T>(opened: &std::io::Result<T>) -> bool {
+    !matches!(opened, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether a subkey with this name still exists in any of the three locations, or
+/// could not be ruled out.
 pub fn still_registered(key: &str) -> bool {
     locations().iter().any(|(root, path)| {
-        root.open_subkey_with_flags(path, KEY_READ)
-            .and_then(|p| p.open_subkey_with_flags(key, KEY_READ))
-            .is_ok()
+        answers_registered(
+            &root
+                .open_subkey_with_flags(path, KEY_READ)
+                .and_then(|p| p.open_subkey_with_flags(key, KEY_READ)),
+        )
     })
 }
 
@@ -220,6 +230,21 @@ mod tests {
         assert_eq!(e.install_date, None);
         assert_eq!(e.size, 0);
         assert_eq!(parse_date("20241345"), None);
+    }
+
+    #[test]
+    fn only_a_key_that_is_not_found_counts_as_gone() {
+        let err = |kind| Err::<(), _>(std::io::Error::from(kind));
+        assert!(!answers_registered(&err(std::io::ErrorKind::NotFound)));
+        assert!(answers_registered(&err(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(answers_registered(&err(std::io::ErrorKind::Other)));
+        assert!(answers_registered(&Ok(())));
+        // What winreg hands back for a missing key, ERROR_FILE_NOT_FOUND.
+        assert!(!answers_registered(&Err::<(), _>(
+            std::io::Error::from_raw_os_error(2)
+        )));
     }
 
     #[test]

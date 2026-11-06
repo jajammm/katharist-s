@@ -893,18 +893,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the real Recycle Bin"]
     fn recycling_a_folder_with_a_locked_file_keeps_that_file() {
         let dir = tmp();
         let top = dir.path().join("katharistis-test-folder-locked");
         fs::create_dir(&top).unwrap();
         let locked = top.join("katharistis-test-locked.txt");
         write_kib(&locked, 4);
-        write_kib(&top.join("katharistis-test-other.txt"), 4);
+        let sibling = top.join("katharistis-test-other.txt");
+        write_kib(&sibling, 4);
         let target = t(&top);
         let _guard = lock(&locked);
         let r = del(&[target], DeleteMode::RecycleBin, &ctx());
         assert_eq!(r.failed.len(), 1, "{r:?}");
         assert!(locked.exists());
+        assert!(sibling.exists(), "the file beside the locked one stays too");
         assert!(r.recycled.is_empty() && r.removed.is_empty());
         assert_eq!(r.bytes_in_bin, 0);
     }
@@ -1050,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the real Recycle Bin"]
     fn recycling_a_literal_trailing_dot_name_does_not_hit_its_sibling() {
         let dir = tmp();
         let plain = dir.path().join("katharistis-test-recycle-name");
@@ -1106,6 +1110,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the real Recycle Bin"]
     fn drive_without_bin_never_deletes_silently() {
         let dir = tmp();
         let drive = SubstDrive::mount(dir.path());
@@ -1311,6 +1316,7 @@ mod tests {
 
     /// Reaches the guard removal without adding anything to the bin.
     #[test]
+    #[ignore = "uses the real Recycle Bin"]
     fn a_read_only_file_keeps_its_attribute_when_the_guard_goes() {
         let dir = tmp();
         let drive = SubstDrive::mount(dir.path());

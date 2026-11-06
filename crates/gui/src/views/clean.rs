@@ -3,6 +3,7 @@
 //! confirmation flow, after the user confirms what the request lists.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use katharistis_core::delete::{DeleteMode, Target};
@@ -140,12 +141,14 @@ pub struct CleanState {
     started: bool,
     cancelled: bool,
     failed: bool,
+    /// The excluded folders the list was made with.
+    excluded: Vec<PathBuf>,
 }
 
 impl CleanState {
     /// Scans in a job. The old list goes first: nothing can be ticked from it while a
     /// newer one is on its way.
-    pub fn start_scan(&mut self, ctx: &egui::Context) {
+    pub fn start_scan(&mut self, ctx: &egui::Context, excluded: &[PathBuf]) {
         if self.scan.is_some() {
             return;
         }
@@ -154,10 +157,12 @@ impl CleanState {
         self.failed = false;
         self.cats.clear();
         self.expanded.clear();
+        self.excluded = excluded.to_vec();
+        let excluded = excluded.to_vec();
         let progress = ScanProgress::default();
         let seen = progress.clone();
         let job = Job::spawn(ctx.clone(), move || {
-            scan_junk(&JunkRoots::from_env(), SystemTime::now(), &seen)
+            scan_junk(&JunkRoots::from_env(), SystemTime::now(), &excluded, &seen)
         });
         self.scan = Some(RunningScan { job, progress });
     }
@@ -254,9 +259,16 @@ fn item_rows(ui: &mut egui::Ui, cat: &mut JunkCategory, idx: usize) {
 
 /// Draws the screen. Returns the request when the user asks to delete what is
 /// ticked; the caller hands it to the confirmation flow. `busy` is a flow in progress.
-pub fn show(ui: &mut egui::Ui, state: &mut CleanState, busy: bool) -> Option<ConfirmRequest> {
-    if !state.started {
-        state.start_scan(ui.ctx());
+/// A list made before the excluded folders changed may hold one of them ticked, so it
+/// is made again.
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &mut CleanState,
+    busy: bool,
+    excluded: &[PathBuf],
+) -> Option<ConfirmRequest> {
+    if !state.started || (!busy && state.scan.is_none() && state.excluded != excluded) {
+        state.start_scan(ui.ctx(), excluded);
     }
     let scanning = state.scan.is_some();
     let mut request = None;
@@ -290,7 +302,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CleanState, busy: bool) -> Option<Con
                 .add_enabled(!busy, egui::Button::new(l("Scan again", "Pindai ulang")))
                 .clicked()
             {
-                state.start_scan(ui.ctx());
+                state.start_scan(ui.ctx(), excluded);
             }
             let pending = request_from(&state.cats);
             let go = ui.add_enabled(
@@ -340,7 +352,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut CleanState, busy: bool) -> Option<Con
 mod tests {
     use super::*;
     use katharistis_core::junk::{JunkItem, JunkKind};
-    use std::path::PathBuf;
 
     fn item(name: &str, size: u64, checked: bool) -> JunkItem {
         JunkItem {
@@ -489,7 +500,7 @@ mod tests {
         let ctx = egui::Context::default();
         for _ in 0..2 {
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                assert!(show(ui, &mut state, false).is_none());
+                assert!(show(ui, &mut state, false, &[]).is_none());
             });
             out.textures_delta.clear();
         }

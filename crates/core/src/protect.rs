@@ -27,6 +27,9 @@ const VOLUME_ROOT_ITEMS: [&str; 5] = [
     "hiberfil.sys",
     "swapfile.sys",
 ];
+/// What starts Windows, at the root of the volume it is on. Lowercase, as above. On
+/// any other volume these are ordinary names.
+const BOOT_ROOT_ITEMS: [&str; 5] = ["bootmgr", "bootnxt", "boot", "recovery", "efi"];
 
 #[derive(Clone, Debug)]
 pub struct ProtectContext {
@@ -288,6 +291,15 @@ fn violates_root_rules(key: &str) -> bool {
     first.is_empty() || VOLUME_ROOT_ITEMS.contains(&first)
 }
 
+/// Whether `key` is a boot item, or inside one, on the volume of `windows_key`.
+fn is_boot_item(key: &str, windows_key: &str) -> bool {
+    let (Some(volume), Some(after_root)) = (key.get(..3), key.get(3..)) else {
+        return false;
+    };
+    let first = after_root.split('\\').next().unwrap_or("");
+    !volume.starts_with('\\') && windows_key.starts_with(volume) && BOOT_ROOT_ITEMS.contains(&first)
+}
+
 /// Whether `key` is a direct child of the users folder, or a standard folder or
 /// secret folder inside one. Each user's profile gets the same rules as
 /// `ProtectContext::profile`, and the contents of standard folders stay deletable.
@@ -338,6 +350,14 @@ pub fn is_protected(p: &Path, ctx: &ProtectContext) -> bool {
     };
     let keys = [key.as_str(), &resolved_literal, &resolved_normalized];
     if keys.iter().any(|key| violates_root_rules(key)) {
+        return true;
+    }
+    let windows_keys = entry_keys(&ctx.windows_dir);
+    if keys.iter().any(|key| {
+        windows_keys
+            .iter()
+            .any(|windows_key| is_boot_item(key, windows_key))
+    }) {
         return true;
     }
 
@@ -498,6 +518,46 @@ mod tests {
         ] {
             assert!(!is_protected(Path::new(p), &c), "{p}");
         }
+    }
+
+    #[test]
+    fn boot_files_are_protected_at_the_root_of_the_windows_volume_only() {
+        let c = ctx();
+        for p in [
+            r"C:\bootmgr",
+            r"C:\BOOTNXT",
+            r"C:\Boot",
+            r"C:\boot\BCD",
+            r"C:\Recovery",
+            r"C:\recovery\WindowsRE\winre.wim",
+            r"C:\EFI",
+            r"C:\EFI\Microsoft\Boot\bootmgfw.efi",
+        ] {
+            assert!(is_protected(Path::new(p), &c), "{p}");
+        }
+        for p in [
+            r"D:\Boot",
+            r"D:\bootmgr",
+            r"D:\BOOTNXT",
+            r"D:\Recovery",
+            r"D:\EFI\x",
+            r"C:\Games\Boot",
+            r"C:\Bootstrap",
+            r"C:\EFI2",
+        ] {
+            assert!(!is_protected(Path::new(p), &c), "{p}");
+        }
+    }
+
+    #[test]
+    fn boot_files_follow_the_volume_windows_is_on() {
+        let c = ProtectContext {
+            windows_dir: r"D:\Windows".into(),
+            ..ctx()
+        };
+        assert!(is_protected(Path::new(r"D:\Boot"), &c));
+        assert!(is_protected(Path::new(r"D:\bootmgr"), &c));
+        assert!(!is_protected(Path::new(r"C:\Boot"), &c));
     }
 
     #[test]

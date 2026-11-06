@@ -29,8 +29,8 @@ use windows::Win32::UI::Shell::{
     COPYENGINE_E_RECYCLE_BIN_NOT_FOUND, COPYENGINE_E_RECYCLE_FORCE_NUKE,
     COPYENGINE_E_RECYCLE_PATH_TOO_LONG, COPYENGINE_E_RECYCLE_SIZE_TOO_BIG,
     COPYENGINE_E_RECYCLE_UNKNOWN_ERROR, COPYENGINE_E_SHARING_VIOLATION_SRC, FOFX_RECYCLEONDELETE,
-    FOF_ALLOWUNDO, FOF_NO_UI, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO, SIGDN_FILESYSPATH,
-    TSF_DELETE_RECYCLE_IF_POSSIBLE,
+    FOF_ALLOWUNDO, FOF_NO_UI, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
+    SHQUERYRBINFO, SIGDN_FILESYSPATH, TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
 use windows_core::{implement, Ref};
 
@@ -642,11 +642,13 @@ pub fn bin_info() -> io::Result<(u64, u64)> {
     Ok((info.i64Size.max(0) as u64, info.i64NumItems.max(0) as u64))
 }
 
-/// `SHERB_NOCONFIRMATION` stays out of this on purpose: emptying the bin cannot
-/// be undone, so the system asks.
-const EMPTY_BIN_FLAGS: u32 = SHERB_NOSOUND | SHERB_NOPROGRESSUI;
+/// `SHERB_NOCONFIRMATION` is here on purpose. Our own dialog has already read the bin
+/// and asked, and a second prompt from Windows could open behind the app while the
+/// window refuses to close for the running job. Callers must therefore confirm first.
+const EMPTY_BIN_FLAGS: u32 = SHERB_NOCONFIRMATION | SHERB_NOSOUND | SHERB_NOPROGRESSUI;
 
-/// Empties the Recycle Bin on all drives, after the system's own confirmation.
+/// Empties the Recycle Bin on all drives, without a prompt from Windows. Only the
+/// confirmed step of the GUI's delete flow may call this.
 pub fn empty_bin() -> io::Result<()> {
     unsafe { SHEmptyRecycleBinW(None, PCWSTR::null(), EMPTY_BIN_FLAGS) }.map_err(io::Error::from)
 }
@@ -658,7 +660,6 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use tempfile::{Builder, TempDir};
     use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows::Win32::UI::Shell::SHERB_NOCONFIRMATION;
 
     #[test]
     fn guard_names_are_told_from_other_names() {
@@ -980,8 +981,8 @@ mod tests {
     }
 
     #[test]
-    fn emptying_the_bin_keeps_the_confirmation() {
-        assert_eq!(EMPTY_BIN_FLAGS & SHERB_NOCONFIRMATION, 0);
+    fn emptying_the_bin_skips_the_second_prompt_of_windows() {
+        assert_ne!(EMPTY_BIN_FLAGS & SHERB_NOCONFIRMATION, 0);
     }
 
     #[test]

@@ -144,7 +144,8 @@ impl App {
             self.home.refresh_space(ctx);
             self.drive_job = Some(Job::spawn(ctx.clone(), system_drive));
             if self.flow_context == ConfirmContext::Cleanup {
-                self.clean.start_scan(ctx);
+                let excluded = self.excluded();
+                self.clean.start_scan(ctx, &excluded);
             }
         }
         self.guard_close(ctx);
@@ -325,7 +326,8 @@ impl eframe::App for App {
                     }
                     Tool::Clean => {
                         let busy = !self.flow.is_idle();
-                        if let Some(request) = clean::show(ui, &mut self.clean, busy) {
+                        let excluded = self.excluded();
+                        if let Some(request) = clean::show(ui, &mut self.clean, busy, &excluded) {
                             self.start_flow(request);
                         }
                     }

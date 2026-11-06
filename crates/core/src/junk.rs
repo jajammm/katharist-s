@@ -1,5 +1,6 @@
 //! What the cleanup screen offers to delete. Nothing is deleted here.
 
+use crate::protect::canonical_key;
 use crate::recycle;
 use crate::scan::{self, EntryClass, ScanOptions, ScanProgress, ScanTree};
 use crate::win;
@@ -307,7 +308,8 @@ fn general_cache(roots: &JunkRoots, progress: &ScanProgress) -> Found {
     found
 }
 
-fn partial_downloads(roots: &JunkRoots) -> Found {
+/// One changed within a day may still be downloading, or waiting to be resumed.
+fn partial_downloads(roots: &JunkRoots, now: SystemTime) -> Found {
     let mut found = Found::new();
     match list(&roots.downloads) {
         Ok(None) => {}
@@ -333,7 +335,7 @@ fn partial_downloads(roots: &JunkRoots) -> Found {
                     path,
                     name: e.name,
                     size,
-                    checked: true,
+                    checked: !is_recent(e.modified, now),
                 });
             }
         }
@@ -341,24 +343,51 @@ fn partial_downloads(roots: &JunkRoots) -> Found {
     found
 }
 
+/// Whether deleting `path` would touch an excluded folder: it is one, it lies inside
+/// one, or it holds one.
+fn touches_excluded(path: &Path, excluded: &[String]) -> bool {
+    let Some(key) = canonical_key(path) else {
+        return false;
+    };
+    let key = Path::new(&key);
+    excluded.iter().any(|ex| {
+        let ex = Path::new(ex);
+        key.starts_with(ex) || ex.starts_with(key)
+    })
+}
+
 /// Finds the cleanup categories. Always returns all seven, in enum order. With
-/// `progress` cancelled it stops early and returns what it has found so far.
-pub fn scan_junk(roots: &JunkRoots, now: SystemTime, progress: &ScanProgress) -> Vec<JunkCategory> {
+/// `progress` cancelled it stops early and returns what it has found so far. Nothing
+/// that touches an `excluded` folder is offered, since these items go permanently.
+pub fn scan_junk(
+    roots: &JunkRoots,
+    now: SystemTime,
+    excluded: &[PathBuf],
+    progress: &ScanProgress,
+) -> Vec<JunkCategory> {
+    let excluded: Vec<String> = excluded.iter().filter_map(|p| canonical_key(p)).collect();
     let steps: [(JunkKind, &dyn Fn() -> Found); 6] = [
         (JunkKind::Temp, &|| temp(roots, now, progress)),
         (JunkKind::BrowserCache, &|| browser_cache(roots, progress)),
         (JunkKind::CrashLogs, &|| crash_logs(roots, progress)),
         (JunkKind::DevData, &|| dev_data(roots, progress)),
         (JunkKind::GeneralCache, &|| general_cache(roots, progress)),
-        (JunkKind::PartialDownloads, &|| partial_downloads(roots)),
+        (JunkKind::PartialDownloads, &|| {
+            partial_downloads(roots, now)
+        }),
     ];
     let mut out = Vec::new();
     for (kind, step) in steps {
-        let found = if progress.is_cancelled() {
+        let mut found = if progress.is_cancelled() {
             Found::new()
         } else {
             step()
         };
+        if !excluded.is_empty() {
+            found
+                .items
+                .retain(|item| !touches_excluded(&item.path, &excluded));
+        }
         out.push(found.into_category(kind));
     }
     let mut bin = Found::new().into_category(JunkKind::RecycleBin);
@@ -398,7 +427,7 @@ mod tests {
     }
 
     fn run(f: &Fixture, now: SystemTime) -> Vec<JunkCategory> {
-        scan_junk(&f.roots, now, &ScanProgress::default())
+        scan_junk(&f.roots, now, &[], &ScanProgress::default())
     }
 
     fn cat(all: &[JunkCategory], kind: JunkKind) -> &JunkCategory {
@@ -548,6 +577,52 @@ mod tests {
     }
 
     #[test]
+    fn recent_partial_downloads_start_unticked() {
+        let f = fixture();
+        write(&f.roots.downloads.join("live.crdownload"), 10);
+        let now = SystemTime::now();
+
+        let all = run(&f, now);
+        let c = cat(&all, JunkKind::PartialDownloads);
+        assert_eq!(names(c), ["live.crdownload"]);
+        assert!(c.items.iter().all(|i| !i.checked));
+
+        let later = now + Duration::from_secs(25 * 3600);
+        let all = run(&f, later);
+        let c = cat(&all, JunkKind::PartialDownloads);
+        assert!(c.items.iter().all(|i| i.checked));
+    }
+
+    #[test]
+    fn excluded_folders_are_never_offered() {
+        let f = fixture();
+        let r = &f.roots;
+        write(&r.temp.join(r"keep\x"), 10);
+        write(&r.temp.join(r"holds\inner\x"), 10);
+        write(&r.temp.join("other.tmp"), 10);
+        write(&r.local_appdata.join(r"CrashDumps\a.dmp"), 10);
+        write(&r.local_appdata.join(r"pip\Cache\p"), 10);
+        write(&r.local_appdata.join(r"npm-cache\_cacache\n"), 10);
+        write(&r.downloads.join("a.part"), 10);
+        write(&r.downloads.join("b.part"), 10);
+        let excluded = [
+            // An item itself, in another case and with a trailing separator.
+            PathBuf::from(format!(r"{}\KEEP\", r.temp.display())),
+            // Something inside an item: deleting the item would take it along.
+            r.temp.join(r"holds\inner"),
+            // A location, and a parent of one.
+            r.local_appdata.join("CrashDumps"),
+            r.local_appdata.join("pip"),
+            r.downloads.join("a.part"),
+        ];
+        let all = scan_junk(r, far_future(), &excluded, &ScanProgress::default());
+        assert_eq!(names(cat(&all, JunkKind::Temp)), ["other.tmp"]);
+        assert!(cat(&all, JunkKind::CrashLogs).items.is_empty());
+        assert_eq!(names(cat(&all, JunkKind::DevData)), ["npm cache"]);
+        assert_eq!(names(cat(&all, JunkKind::PartialDownloads)), ["b.part"]);
+    }
+
+    #[test]
     fn missing_folders_are_empty_not_errors() {
         let f = fixture();
         let all = run(&f, far_future());
@@ -559,7 +634,7 @@ mod tests {
     }
 
     fn nothing_listed(roots: &JunkRoots) {
-        let all = scan_junk(roots, far_future(), &ScanProgress::default());
+        let all = scan_junk(roots, far_future(), &[], &ScanProgress::default());
         for c in &all {
             assert!(c.items.is_empty(), "{:?}: {:?}", c.kind, c.items);
             assert!(!c.unreadable, "{:?}", c.kind);
@@ -603,7 +678,7 @@ mod tests {
             profile: PathBuf::new(),
             downloads: PathBuf::new(),
         };
-        let all = scan_junk(&roots, SystemTime::now(), &ScanProgress::default());
+        let all = scan_junk(&roots, SystemTime::now(), &[], &ScanProgress::default());
         assert!(all.iter().all(|c| c.items.is_empty() && !c.unreadable));
     }
 
@@ -657,7 +732,7 @@ mod tests {
         write(&f.roots.temp.join("a"), 10);
         let progress = ScanProgress::default();
         progress.cancel();
-        let all = scan_junk(&f.roots, far_future(), &progress);
+        let all = scan_junk(&f.roots, far_future(), &[], &progress);
         assert_eq!(all.len(), 7);
         assert!(all.iter().all(|c| c.items.is_empty()));
     }

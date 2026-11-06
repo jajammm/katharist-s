@@ -101,6 +101,11 @@ pub fn find_duplicates(
         }
         let mut by_hash: BTreeMap<Hash, Vec<PathBuf>> = BTreeMap::new();
         for path in paths {
+            // The tree may be hours old: a file dehydrated since the scan would be
+            // downloaded by reading it.
+            if !may_read(attrs_of(&path)) {
+                continue;
+            }
             if let Some(h) = hash_file(&path, Some(progress)) {
                 by_hash.entry(h).or_default().push(path);
             }
@@ -304,6 +309,29 @@ mod tests {
             tree.nodes[root].children.push(id);
         }
         assert!(find_duplicates(&tree, 1, &ScanProgress::default()).is_empty());
+    }
+
+    #[test]
+    fn a_file_gone_cloud_only_since_the_scan_is_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let a = write(d.path(), "a", &[9; 3000]);
+        let b = write(d.path(), "bb", &[9; 3000]);
+        let gone = write(d.path(), "ccc", &[9; 3000]);
+        let tree = do_scan(d.path());
+        // The tree still says it is local. FILE_ATTRIBUTE_OFFLINE is one of the
+        // attributes `is_cloud_only` reads, and an ordinary file can carry it.
+        let wide = win::to_long_path(&gone);
+        unsafe {
+            windows::Win32::Storage::FileSystem::SetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x1000),
+            )
+        }
+        .unwrap();
+        let g = find_duplicates(&tree, 1, &ScanProgress::default());
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].keep, a);
+        assert_eq!(g[0].others, [b]);
     }
 
     #[test]
