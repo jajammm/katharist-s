@@ -174,29 +174,55 @@ fn arp_key(id: &str) -> Option<&str> {
 
 /// Matches registry entries to winget packages: first by `ARP\...\<key>`, then
 /// by normalized name, then by a `…`-truncated name used as a prefix (at
-/// least 4 characters). A package is used once. Unmatched packages that are
+/// least 4 characters). The two name passes accept a pair only when each side
+/// has exactly one candidate, so ambiguous entries stay unmatched. A package is used once. Unmatched packages that are
 /// not frameworks come last as `WingetOnly`.
 pub fn merge(entries: Vec<AppEntry>, packages: Vec<WingetPackage>) -> Vec<AppRow> {
     let mut used = vec![false; packages.len()];
     let mut matched: Vec<Option<usize>> = vec![None; entries.len()];
 
-    let mut pass = |f: &dyn Fn(&AppEntry, &WingetPackage) -> bool| {
+    // Pass 1: the ARP key is unique per entry, so the first hit is enough.
+    for (ei, e) in entries.iter().enumerate() {
+        let hit = (0..packages.len()).find(|&pi| {
+            !used[pi] && arp_key(&packages[pi].id).is_some_and(|k| k.eq_ignore_ascii_case(&e.key))
+        });
+        if let Some(pi) = hit {
+            used[pi] = true;
+            matched[ei] = Some(pi);
+        }
+    }
+
+    // Passes 2 and 3 are fuzzy: a pair is accepted only when it is the sole
+    // candidate in both directions, so list order never decides a match.
+    let mut unique_pass = |f: &dyn Fn(&AppEntry, &WingetPackage) -> bool| {
+        let mut pairs = Vec::new();
         for (ei, e) in entries.iter().enumerate() {
             if matched[ei].is_some() {
                 continue;
             }
-            if let Some(pi) = (0..packages.len()).find(|&pi| !used[pi] && f(e, &packages[pi])) {
-                used[pi] = true;
-                matched[ei] = Some(pi);
+            let mut hits = (0..packages.len()).filter(|&pi| !used[pi] && f(e, &packages[pi]));
+            let (Some(pi), None) = (hits.next(), hits.next()) else {
+                continue;
+            };
+            let rivals = entries
+                .iter()
+                .enumerate()
+                .filter(|(oi, o)| matched[*oi].is_none() && f(o, &packages[pi]))
+                .count();
+            if rivals == 1 {
+                pairs.push((ei, pi));
             }
         }
+        for (ei, pi) in pairs {
+            used[pi] = true;
+            matched[ei] = Some(pi);
+        }
     };
-    pass(&|e, p| arp_key(&p.id).is_some_and(|k| k.eq_ignore_ascii_case(&e.key)));
-    pass(&|e, p| {
+    unique_pass(&|e, p| {
         let n = normalize(&e.name);
         !n.is_empty() && n == normalize(&p.name)
     });
-    pass(&|e, p| {
+    unique_pass(&|e, p| {
         p.name.strip_suffix('…').is_some_and(|stem| {
             let stem = normalize(stem);
             stem.chars().count() >= 4 && normalize(&e.name).starts_with(&stem)
@@ -217,6 +243,11 @@ pub fn merge(entries: Vec<AppEntry>, packages: Vec<WingetPackage>) -> Vec<AppRow
     );
     rows
 }
+
+/// `APPINSTALLER_CLI_ERROR_SOURCE_AGREEMENTS_NOT_ACCEPTED` is 0x8A150046
+/// (-1978335162 as i32), from winget-cli's doc/windows/package-manager/winget/returnCodes.md
+/// (the source of Microsoft's published winget return codes).
+const SOURCE_AGREEMENTS_NOT_ACCEPTED: i32 = 0x8A15_0046_u32 as i32;
 
 fn mentions_agreement(text: &str) -> bool {
     let t = text.to_lowercase();
@@ -253,7 +284,7 @@ fn classify(exit: Option<i32>, stdout: &str, stderr: &str) -> WingetOutcome {
         .copied()
         .collect::<Vec<_>>()
         .join("\n");
-    if mentions_agreement(&combined) {
+    if exit == Some(SOURCE_AGREEMENTS_NOT_ACCEPTED) || mentions_agreement(&combined) {
         return WingetOutcome::NeedsAgreement(combined);
     }
     if !err.is_empty() {
@@ -523,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_uses_each_package_once_and_ignores_short_prefixes() {
+    fn ambiguous_name_matches_stay_unmatched() {
         let entries = vec![
             entry("a", "Foo"),
             entry("b", "Foo"),
@@ -531,15 +562,88 @@ mod tests {
         ];
         let packages = vec![pkg("Fo…", "Vendor.Fo"), pkg("Foo", "Vendor.Foo")];
         let rows = merge(entries, packages);
-        let matched = rows
+        assert_eq!(rows.len(), 5);
+        assert!(rows[..3]
             .iter()
-            .filter(|r| matches!(r, AppRow::Registry(_, Some(_))))
-            .count();
-        assert_eq!(matched, 1);
-        assert!(matches!(&rows[0], AppRow::Registry(_, Some(p)) if p.id == "Vendor.Foo"));
-        assert!(matches!(&rows[2], AppRow::Registry(_, None)));
-        assert_eq!(rows.len(), 4);
+            .all(|r| matches!(r, AppRow::Registry(_, None))));
         assert!(matches!(&rows[3], AppRow::WingetOnly(p) if p.id == "Vendor.Fo"));
+        assert!(matches!(&rows[4], AppRow::WingetOnly(p) if p.id == "Vendor.Foo"));
+    }
+
+    #[test]
+    fn duplicate_full_names_do_not_swap_packages() {
+        let name = "Microsoft Visual C++ 2015-2022 Redistributable";
+        let entries = vec![entry("x64key", name), entry("x86key", name)];
+        let packages = vec![
+            pkg(name, "Microsoft.VCRedist.2015+.x64"),
+            pkg(name, "Microsoft.VCRedist.2015+.x86"),
+        ];
+        let rows = merge(entries.clone(), packages.clone());
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0], AppRow::Registry(_, None)));
+        assert!(matches!(&rows[1], AppRow::Registry(_, None)));
+        assert!(matches!(&rows[2], AppRow::WingetOnly(_)));
+        assert!(matches!(&rows[3], AppRow::WingetOnly(_)));
+        // Reversed package order gives the same result.
+        let mut rev = packages;
+        rev.reverse();
+        let rows = merge(entries, rev);
+        assert!(rows[..2]
+            .iter()
+            .all(|r| matches!(r, AppRow::Registry(_, None))));
+    }
+
+    #[test]
+    fn duplicate_full_names_still_match_by_arp_key() {
+        let name = "Redistributable Tool";
+        let entries = vec![entry("k64", name), entry("k86", name)];
+        let packages = vec![
+            pkg(name, r"ARP\Machine\X86\k86"),
+            pkg(name, r"ARP\Machine\X64\k64"),
+        ];
+        let rows = merge(entries, packages);
+        assert!(matches!(&rows[0], AppRow::Registry(_, Some(p)) if p.id.ends_with("k64")));
+        assert!(matches!(&rows[1], AppRow::Registry(_, Some(p)) if p.id.ends_with("k86")));
+    }
+
+    #[test]
+    fn duplicate_truncated_names_stay_unmatched() {
+        let entries = vec![entry("a", "Visual Studio Community 2022")];
+        let packages = vec![
+            pkg(
+                "Visual Studio Commun…",
+                "Microsoft.VisualStudio.2022.Community",
+            ),
+            pkg(
+                "Visual Studio Commun…",
+                "Microsoft.VisualStudio.2019.Community",
+            ),
+        ];
+        let rows = merge(entries, packages);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[0], AppRow::Registry(_, None)));
+
+        // One truncated package, two entries sharing the prefix.
+        let entries = vec![
+            entry("a", "Visual Studio Community 2022"),
+            entry("b", "Visual Studio Community 2019"),
+        ];
+        let packages = vec![pkg(
+            "Visual Studio Commun…",
+            "Microsoft.VisualStudio.2022.Community",
+        )];
+        let rows = merge(entries, packages);
+        assert!(rows[..2]
+            .iter()
+            .all(|r| matches!(r, AppRow::Registry(_, None))));
+        assert!(matches!(&rows[2], AppRow::WingetOnly(_)));
+    }
+
+    #[test]
+    fn short_prefix_is_ignored() {
+        let rows = merge(vec![entry("a", "Foobar")], vec![pkg("Fo…", "Vendor.Fo")]);
+        assert!(matches!(&rows[0], AppRow::Registry(_, None)));
+        assert!(matches!(&rows[1], AppRow::WingetOnly(_)));
     }
 
     #[test]
@@ -574,6 +678,19 @@ mod tests {
         assert!(matches!(
             classify(Some(1), "", id),
             WingetOutcome::NeedsAgreement(_)
+        ));
+    }
+
+    #[test]
+    fn outcome_needs_agreement_by_exit_code_alone() {
+        assert!(matches!(
+            classify(Some(0x8A15_0046_u32 as i32), "", ""),
+            WingetOutcome::NeedsAgreement(_)
+        ));
+        assert_eq!(0x8A15_0046_u32 as i32, -1978335162);
+        assert!(matches!(
+            classify(Some(-1978335163), "", ""),
+            WingetOutcome::Failed(_)
         ));
     }
 
