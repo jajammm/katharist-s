@@ -48,7 +48,8 @@ pub struct JunkRoots {
 }
 
 impl JunkRoots {
-    /// An unset variable gives an empty path, which `scan_junk` treats as missing.
+    /// An unset variable gives an empty path. Any path that is not absolute counts
+    /// as missing, so it is never read relative to the working directory.
     pub fn from_env() -> Self {
         let var = |name| {
             std::env::var_os(name)
@@ -120,7 +121,7 @@ fn is_missing(e: &io::Error) -> bool {
 
 /// Sizes a folder with the disk map's scan. `Ok(None)` when it does not exist.
 fn scan_folder(dir: &Path, progress: &ScanProgress) -> io::Result<Option<ScanTree>> {
-    if dir.as_os_str().is_empty() {
+    if !dir.is_absolute() {
         return Ok(None);
     }
     match scan::scan(dir, &options(), progress) {
@@ -132,7 +133,7 @@ fn scan_folder(dir: &Path, progress: &ScanProgress) -> io::Result<Option<ScanTre
 
 /// Lists a folder, `Ok(None)` when it does not exist.
 fn list(dir: &Path) -> io::Result<Option<Vec<win::DirEntry>>> {
-    if dir.as_os_str().is_empty() {
+    if !dir.is_absolute() {
         return Ok(None);
     }
     match win::list_dir(dir) {
@@ -555,6 +556,43 @@ mod tests {
             assert!(c.items.is_empty(), "{:?}", c.kind);
             assert!(!c.unreadable, "{:?}", c.kind);
         }
+    }
+
+    fn nothing_listed(roots: &JunkRoots) {
+        let all = scan_junk(roots, far_future(), &ScanProgress::default());
+        for c in &all {
+            assert!(c.items.is_empty(), "{:?}: {:?}", c.kind, c.items);
+            assert!(!c.unreadable, "{:?}", c.kind);
+        }
+    }
+
+    #[test]
+    fn empty_roots_ignore_matching_folders_in_cwd() {
+        // The working directory is crates/core under cargo test. A real folder
+        // tree there must not be reached through empty roots.
+        let cwd = tempfile::Builder::new()
+            .prefix("junk-cwd-")
+            .tempdir_in(".")
+            .unwrap();
+        write(&cwd.path().join(r"CrashDumps\x"), 10);
+        write(&cwd.path().join(r".gradle\caches\x"), 10);
+        write(&cwd.path().join(r".cache\x"), 10);
+        write(&cwd.path().join(r"Downloads\a.part"), 10);
+        write(&cwd.path().join(r"pip\Cache\x"), 10);
+        write(
+            &cwd.path().join(r"Google\Chrome\User Data\Default\Cache\x"),
+            10,
+        );
+        // Roots named relative to the working directory must count as missing.
+        let rel = PathBuf::from(cwd.path().file_name().unwrap());
+        assert!(!rel.is_absolute());
+        let roots = JunkRoots {
+            temp: rel.clone(),
+            local_appdata: rel.clone(),
+            profile: rel.clone(),
+            downloads: rel.join("Downloads"),
+        };
+        nothing_listed(&roots);
     }
 
     #[test]
