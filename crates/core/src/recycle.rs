@@ -337,6 +337,12 @@ pub(crate) fn recycle_with_unknown_quota(p: &Path) -> Result<RecycleOutcome, Fai
     on_recycle_thread(p, Some(Preflight::QuotaUnknown))
 }
 
+#[cfg(test)]
+pub(crate) fn real_quota_bytes(p: &Path) -> Option<u64> {
+    let mib = read_bin_settings(p).max_capacity_mib?;
+    Some(u64::from(mib) * (1 << 20))
+}
+
 fn on_recycle_thread(p: &Path, preflight: Option<Preflight>) -> Result<RecycleOutcome, FailReason> {
     let path = p.to_path_buf();
     let worker = thread::Builder::new()
@@ -351,29 +357,68 @@ fn on_recycle_thread(p: &Path, preflight: Option<Preflight>) -> Result<RecycleOu
         .unwrap_or_else(|_| Err(FailReason::Other("the recycle thread panicked".into())))
 }
 
-/// `PreDeleteItem` carries the same flags for a single file too big for the bin as
-/// for one that fits, and the shell then deletes it for good. Folders do not need
-/// this: their too-big children arrive without the flag. So files, and files only,
-/// get the preflight and the guard.
-fn recycle_item(p: &Path, forced: Option<Preflight>) -> Result<RecycleOutcome, FailReason> {
-    let io_reason = |e: io::Error| reason_from_os_code(e.raw_os_error().unwrap_or(0));
-    let entry = win::entry_info(p).map_err(io_reason)?;
-    if classify(entry.attrs, entry.reparse_tag) != EntryClass::File {
-        return perform(p);
-    }
+fn io_reason(e: io::Error) -> FailReason {
+    reason_from_os_code(e.raw_os_error().unwrap_or(0))
+}
 
+/// `PreDeleteItem` carries the same flags for a single file too big for the bin as
+/// for one that fits, and the shell then deletes it for good, so its answer alone
+/// is not enough. Links stay out of the bin altogether: a recycled junction adds a
+/// size to the bin's total that nothing explains.
+fn recycle_item(p: &Path, forced: Option<Preflight>) -> Result<RecycleOutcome, FailReason> {
+    let entry = win::entry_info(p).map_err(io_reason)?;
+    match classify(entry.attrs, entry.reparse_tag) {
+        EntryClass::Link => Err(FailReason::NotRecyclable),
+        EntryClass::Dir => recycle_folder(p),
+        EntryClass::File => recycle_file(p, &entry.name, forced),
+    }
+}
+
+/// A folder has no guard, so it goes to the shell only if everything says it fits.
+fn recycle_folder(p: &Path) -> Result<RecycleOutcome, FailReason> {
+    let Some(logical_len) = folder_logical_len(p).map_err(io_reason)? else {
+        return Err(FailReason::NotRecyclable);
+    };
+    match decide_preflight(read_bin_settings(p), logical_len) {
+        Preflight::Fits => perform(p),
+        Preflight::Refuse | Preflight::QuotaUnknown => Err(FailReason::NotRecyclable),
+    }
+}
+
+/// The logical length of everything under `root`, or `None` if a link is in there
+/// at any depth. Links are not entered and no file's data is opened, so nothing is
+/// recalled from the cloud.
+fn folder_logical_len(root: &Path) -> io::Result<Option<u64>> {
+    let mut total = 0u64;
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in win::list_dir(&folder)? {
+            let path = folder.join(&entry.name);
+            match classify(entry.attrs, entry.reparse_tag) {
+                EntryClass::Link => return Ok(None),
+                EntryClass::Dir => folders.push(path),
+                EntryClass::File => total = total.saturating_add(win::logical_len(&path)?),
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+fn recycle_file(
+    p: &Path,
+    name_on_disk: &str,
+    forced: Option<Preflight>,
+) -> Result<RecycleOutcome, FailReason> {
     let logical_len = win::logical_len(p).map_err(io_reason)?;
     let preflight = forced.unwrap_or_else(|| decide_preflight(read_bin_settings(p), logical_len));
     if preflight == Preflight::Refuse {
         return Err(FailReason::NotRecyclable);
     }
-    // The shell cannot take a locked file, and a guard could not be removed again
-    // for as long as the lock lasts.
-    if win::is_locked_against_delete(p) {
-        return Err(FailReason::InUse);
-    }
+    // If this file cannot be deleted the shell will not get any further, and a guard
+    // made now might not be removable either, so this is the place to say why.
+    win::check_deletable(p).map_err(io_reason)?;
 
-    match Guard::create(p, &entry.name) {
+    match Guard::create(p, name_on_disk) {
         Some(guard) => {
             let outcome = perform(p);
             guard.settle(p, outcome)
@@ -478,40 +523,26 @@ impl Guard {
         None
     }
 
-    /// Other programs, such as a virus scanner, can hold the file for a moment.
-    fn remove(&self) -> io::Result<()> {
-        let mut result = win::delete_name(&self.path);
-        for _ in 0..10 {
-            if result.is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-            result = win::delete_name(&self.path);
-        }
-        result
-    }
-
     /// Ends the guard. The guard may hold the only remaining copy, so it is removed
     /// only with proof that the data lives on under another name; otherwise it
-    /// becomes the original again or, failing that, is left where it is and named
-    /// in the failure.
+    /// becomes the original again or, failing that, stays and is named by
+    /// `FailReason::GuardKept`.
+    ///
+    /// If the original is still there, the shell's reason is the one worth telling.
+    /// A guard that then cannot go is a spare name for a file that is safe.
     fn settle(
         self,
         original: &Path,
         outcome: Result<RecycleOutcome, FailReason>,
     ) -> Result<RecycleOutcome, FailReason> {
-        let kept = |why: &str| {
-            Err(FailReason::Other(format!(
-                "{why}; the file is kept at {}",
-                self.path.display()
-            )))
+        let kept = || Err(FailReason::GuardKept(self.path.clone()));
+        let Ok((volume, id, links)) = with_retries(|| win::link_info(&self.path)) else {
+            return kept();
         };
-        let Ok((volume, id, links)) = win::link_info(&self.path) else {
-            return kept("the guard could not be checked");
-        };
+        let remove = || with_retries(|| win::delete_name(&self.path));
         // One more name than before the guard: the bin item and this one.
         if outcome == Ok(RecycleOutcome::InBin) && links > self.links_before {
-            return match self.remove() {
+            return match remove() {
                 Ok(()) => outcome,
                 Err(e) => Err(FailReason::Other(format!(
                     "recycled, but {} could not be removed: {e}",
@@ -519,24 +550,24 @@ impl Guard {
                 ))),
             };
         }
-        match win::link_info(original) {
+        match with_retries(|| win::link_info(original)) {
             Ok((original_volume, original_id, _))
                 if (original_volume, original_id) == (volume, id) =>
             {
-                match self.remove() {
-                    // Present means the shell did not succeed, so `outcome` is an
-                    // error here; should it not be, nothing was recycled either.
-                    Ok(()) => outcome.and(Err(FailReason::NotRecyclable)),
-                    Err(e) => Err(FailReason::Other(format!(
+                let removed = remove();
+                match (outcome, removed) {
+                    (Err(reason), _) => Err(reason),
+                    // Present means the shell did not succeed, so this should not
+                    // happen; either way nothing was recycled.
+                    (Ok(_), Ok(())) => Err(FailReason::NotRecyclable),
+                    (Ok(_), Err(e)) => Err(FailReason::Other(format!(
                         "{} could not be removed: {e}",
                         self.path.display()
                     ))),
                 }
             }
-            Err(e)
-                if reason_from_os_code(e.raw_os_error().unwrap_or(0)) == FailReason::NotFound =>
-            {
-                match win::rename_no_replace(&self.path, &self.restore_to) {
+            Err(e) if is_missing(&e) => {
+                match with_retries(|| win::rename_no_replace(&self.path, &self.restore_to)) {
                     Ok(()) => {
                         #[cfg(test)]
                         RESTORED
@@ -545,12 +576,30 @@ impl Guard {
                             .push(self.restore_to.clone());
                         outcome.and(Err(FailReason::NotRecyclable))
                     }
-                    Err(_) => kept("the shell deleted the file and it could not be restored"),
+                    Err(_) => kept(),
                 }
             }
-            _ => kept("the original could not be matched to the guard"),
+            _ => kept(),
         }
     }
+}
+
+fn is_missing(e: &io::Error) -> bool {
+    reason_from_os_code(e.raw_os_error().unwrap_or(0)) == FailReason::NotFound
+}
+
+/// Other programs, such as a virus scanner, can hold a file for a moment. Something
+/// that is simply not there will not come back, so that answer is final.
+fn with_retries<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut result = op();
+    for _ in 0..10 {
+        match &result {
+            Err(e) if !is_missing(e) => thread::sleep(Duration::from_millis(50)),
+            _ => break,
+        }
+        result = op();
+    }
+    result
 }
 
 /// `(bytes, items)` in the Recycle Bin, over all drives.
@@ -575,8 +624,115 @@ pub fn empty_bin() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::windows::fs::OpenOptionsExt;
+    use tempfile::{Builder, TempDir};
     use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows::Win32::UI::Shell::SHERB_NOCONFIRMATION;
+
+    fn guarded_file() -> (TempDir, PathBuf, Guard) {
+        let dir = Builder::new()
+            .prefix("katharistis-test-")
+            .tempdir()
+            .unwrap();
+        let file = dir.path().join("katharistis-test-file.txt");
+        fs::write(&file, "the data").unwrap();
+        let guard = Guard::create(&file, "katharistis-test-file.txt").unwrap();
+        (dir, file, guard)
+    }
+
+    fn exclusive(p: &Path) -> fs::File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(p)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_restore_outlasts_a_handle_that_goes_away() {
+        let (_dir, file, guard) = guarded_file();
+        let guard_path = guard.path.clone();
+        fs::remove_file(&file).unwrap();
+        let held = exclusive(&guard_path);
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+
+        let outcome = guard.settle(&file, Ok(RecycleOutcome::DeletedPermanently));
+
+        release.join().unwrap();
+        assert_eq!(outcome, Err(FailReason::NotRecyclable));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "the data");
+        assert!(!guard_path.exists());
+    }
+
+    #[test]
+    fn a_restore_that_stays_blocked_names_where_the_data_is() {
+        let (_dir, file, guard) = guarded_file();
+        let guard_path = guard.path.clone();
+        fs::remove_file(&file).unwrap();
+        let held = exclusive(&guard_path);
+
+        let outcome = guard.settle(&file, Ok(RecycleOutcome::DeletedPermanently));
+
+        drop(held);
+        assert_eq!(outcome, Err(FailReason::GuardKept(guard_path.clone())));
+        assert_eq!(fs::read_to_string(&guard_path).unwrap(), "the data");
+    }
+
+    #[test]
+    fn a_new_file_at_the_original_name_is_not_overwritten() {
+        let (_dir, file, guard) = guarded_file();
+        let guard_path = guard.path.clone();
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, "something new").unwrap();
+
+        let outcome = guard.settle(&file, Ok(RecycleOutcome::DeletedPermanently));
+
+        assert_eq!(outcome, Err(FailReason::GuardKept(guard_path.clone())));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "something new");
+        assert_eq!(fs::read_to_string(&guard_path).unwrap(), "the data");
+    }
+
+    #[test]
+    fn the_shells_reason_survives_a_guard_that_cannot_go() {
+        let (_dir, file, guard) = guarded_file();
+        let guard_path = guard.path.clone();
+        let held = exclusive(&guard_path);
+
+        let outcome = guard.settle(&file, Err(FailReason::AccessDenied));
+
+        drop(held);
+        assert_eq!(outcome, Err(FailReason::AccessDenied));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "the data");
+        assert!(guard_path.exists(), "nothing could remove it");
+    }
+
+    #[test]
+    fn the_folder_walk_sums_lengths_and_does_not_enter_links() {
+        let dir = Builder::new()
+            .prefix("katharistis-test-")
+            .tempdir()
+            .unwrap();
+        let top = dir.path().join("top");
+        fs::create_dir_all(top.join(r"a\b")).unwrap();
+        fs::write(top.join("one"), [0; 100]).unwrap();
+        fs::write(top.join(r"a\b\two"), [0; 23]).unwrap();
+        assert_eq!(folder_logical_len(&top).unwrap(), Some(123));
+
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(top.join(r"a\b\link"))
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(folder_logical_len(&top).unwrap(), None);
+        assert!(folder_logical_len(&top.join("missing")).is_err());
+    }
 
     #[test]
     fn pre_delete_aborts_without_recycle_flag() {

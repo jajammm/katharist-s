@@ -31,6 +31,9 @@ pub enum FailReason {
     InUse,
     AccessDenied,
     NotRecyclable,
+    /// The shell deleted the file and it could not be put back under its name. The
+    /// data is safe, at this path.
+    GuardKept(PathBuf),
     Other(String),
 }
 
@@ -262,7 +265,7 @@ pub fn delete(targets: &[Target], mode: DeleteMode, ctx: &ProtectContext) -> Del
 mod tests {
     use super::*;
     use crate::protect::canonical_for_delete;
-    use crate::recycle::{bin_info, recycle_with_unknown_quota, RESTORED};
+    use crate::recycle::{bin_info, real_quota_bytes, recycle_with_unknown_quota, RESTORED};
     use crate::{scan, win};
     use std::fs;
     use std::io::{Read, Write};
@@ -744,8 +747,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "uses the real Recycle Bin"]
-    fn recycling_a_junction_leaves_its_target_alone() {
+    fn a_junction_does_not_go_to_the_bin() {
         let dir = tmp();
         let outside = dir.path().join("outside");
         fs::create_dir(&outside).unwrap();
@@ -753,9 +755,134 @@ mod tests {
         write_kib(&keep, 1);
         let link = dir.path().join("katharistis-test-link");
         junction(&link, &outside);
+        let before = bin_info().unwrap();
+
         let r = del(&[t(&link)], DeleteMode::RecycleBin, &ctx());
-        eprintln!("recycling a junction: {r:?}");
-        assert!(keep.exists(), "the junction's target must survive");
+
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
+        assert!(r.recycled.is_empty() && r.removed.is_empty());
+        assert_eq!((r.bytes_freed, r.bytes_in_bin), (0, 0));
+        assert!(fs::symlink_metadata(&link).is_ok(), "the link stays");
+        assert!(keep.exists(), "its target stays");
+        assert_eq!(bin_info().unwrap(), before);
+    }
+
+    #[test]
+    fn a_folder_holding_a_junction_at_any_depth_does_not_go_to_the_bin() {
+        let dir = tmp();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let keep = outside.join("katharistis-test-keep.txt");
+        write_kib(&keep, 1);
+        let top = dir.path().join("katharistis-test-folder");
+        let deep = top.join(r"a\b\c");
+        fs::create_dir_all(&deep).unwrap();
+        let own = top.join(r"a\own.txt");
+        write_kib(&own, 1);
+        let link = deep.join("nested-link");
+        junction(&link, &outside);
+        let before = bin_info().unwrap();
+
+        let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
+
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
+        assert!(own.exists() && keep.exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert_eq!(bin_info().unwrap(), before);
+
+        // Permanent still removes the link and leaves what it points at.
+        let r = del(&[t(&top)], DeleteMode::Permanent, &ctx());
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert!(!top.exists());
+        assert!(keep.exists());
+    }
+
+    /// Takes the delete rights away and gives them back when dropped, also when the
+    /// test fails. Full rights on a folder allow deleting what is in it whatever the
+    /// file says, so the folder has to be denied as well.
+    struct DeleteDenied {
+        file: PathBuf,
+        folder: PathBuf,
+    }
+
+    impl DeleteDenied {
+        fn apply(file: &Path, folder: &Path) -> DeleteDenied {
+            let denied = DeleteDenied {
+                file: file.to_path_buf(),
+                folder: folder.to_path_buf(),
+            };
+            let user = std::env::var("USERNAME").unwrap();
+            for (path, right) in [(file, "DE"), (folder, "DC")] {
+                let out = Command::new("icacls")
+                    .arg(path)
+                    .arg("/deny")
+                    .arg(format!("{user}:({right})"))
+                    .output()
+                    .expect("icacls runs");
+                assert!(out.status.success(), "icacls failed: {out:?}");
+            }
+            denied
+        }
+    }
+
+    impl Drop for DeleteDenied {
+        fn drop(&mut self) {
+            let user = std::env::var("USERNAME").unwrap_or_default();
+            for path in [&self.file, &self.folder] {
+                let _ = Command::new("icacls")
+                    .arg(path)
+                    .arg("/remove:d")
+                    .arg(&user)
+                    .output();
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_that_may_not_be_deleted_is_reported_as_such() {
+        let dir = tmp();
+        let f = dir.path().join("katharistis-test-denied.txt");
+        write_kib(&f, 4);
+        let target = t(&f);
+        let _denied = DeleteDenied::apply(&f, dir.path());
+        let before = bin_info().unwrap();
+
+        let r = del(&[target], DeleteMode::RecycleBin, &ctx());
+
+        eprintln!("a file that may not be deleted: {r:?}");
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert_eq!(r.failed[0].reason, FailReason::AccessDenied);
+        assert_eq!(fs::metadata(&f).unwrap().len(), 4 * 1024);
+        assert_no_guard(dir.path());
+        assert_eq!(bin_info().unwrap(), before);
+    }
+
+    /// Every child fits the quota, and only together do they not.
+    #[test]
+    #[ignore = "uses the real Recycle Bin"]
+    fn a_folder_over_the_quota_stays_when_each_child_fits() {
+        let dir = tmp();
+        let quota = real_quota_bytes(dir.path()).expect("needs a known quota");
+        let top = dir.path().join("katharistis-test-many-sparse");
+        fs::create_dir(&top).unwrap();
+        let child = quota / 4 * 3;
+        let children = [top.join("one.bin"), top.join("two.bin")];
+        for path in &children {
+            assert_eq!(sparse_file(path, child), child);
+        }
+        let before = bin_info().unwrap();
+
+        let r = del(&[t(&top)], DeleteMode::RecycleBin, &ctx());
+
+        eprintln!("{child} bytes twice against a quota of {quota}: {r:?}");
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert_eq!(r.failed[0].reason, FailReason::NotRecyclable);
+        for path in &children {
+            assert_eq!(fs::metadata(path).unwrap().len(), child);
+        }
+        assert_eq!(bin_info().unwrap(), before);
     }
 
     #[test]
@@ -920,7 +1047,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "uses the real Recycle Bin"]
     fn oversized_sparse_file_inside_a_folder_stays() {
         let dir = tmp();
         let top = dir.path().join("katharistis-test-sparse-folder");

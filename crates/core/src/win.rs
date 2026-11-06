@@ -6,9 +6,7 @@ use std::path::{Component, Path, Prefix};
 use std::time::{Duration, SystemTime};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, FILETIME, HANDLE,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, CreateHardLinkW, DeleteFileW, FileDispositionInfoEx, FindClose, FindExInfoBasic,
     FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW,
@@ -342,15 +340,11 @@ pub(crate) fn delete_name(p: &Path) -> io::Result<()> {
         .map_err(io::Error::from)
 }
 
-/// Whether another handle stops this file from being deleted right now.
-pub(crate) fn is_locked_against_delete(p: &Path) -> bool {
-    match open_for_delete(p) {
-        Ok(handle) => {
-            let _ = unsafe { CloseHandle(handle) };
-            false
-        }
-        Err(e) => e.raw_os_error() == Some(ERROR_SHARING_VIOLATION.to_hresult().0),
-    }
+/// Whether this file can be opened for deleting right now. Deletes nothing.
+pub(crate) fn check_deletable(p: &Path) -> io::Result<()> {
+    let handle = open_for_delete(p)?;
+    let _ = unsafe { CloseHandle(handle) };
+    Ok(())
 }
 
 /// The `{guid}` of the volume holding `p`. `None` where there is no such thing to
