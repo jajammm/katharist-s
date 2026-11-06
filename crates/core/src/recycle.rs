@@ -42,6 +42,13 @@ const BIT_BUCKET_VOLUMES: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume";
 const GUARD_PREFIX: &str = ".katharistis-guard-";
 
+/// Whether a file name is one of ours: a guard left behind by a recycle that could
+/// not confirm the file back. Its data may exist nowhere else, so nothing offers it
+/// for deletion.
+pub fn is_guard_name(name: &str) -> bool {
+    name.to_lowercase().starts_with(GUARD_PREFIX)
+}
+
 pub enum PreDelete {
     Proceed,
     Abort,
@@ -650,6 +657,15 @@ mod tests {
     use tempfile::{Builder, TempDir};
     use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows::Win32::UI::Shell::SHERB_NOCONFIRMATION;
+
+    #[test]
+    fn guard_names_are_told_from_other_names() {
+        assert!(is_guard_name(".katharistis-guard-123-0"));
+        assert!(is_guard_name(".KATHARISTIS-GUARD-123-0"));
+        assert!(!is_guard_name("katharistis-guard-123-0"));
+        assert!(!is_guard_name(".katharistis-guardian"));
+        assert!(!is_guard_name("notes.txt"));
+    }
 
     fn guarded_file() -> (TempDir, PathBuf, Guard) {
         let dir = Builder::new()

@@ -105,6 +105,15 @@ impl PermanentOffer {
     }
 }
 
+/// Takes out the `NotRecyclable` failure of each item sent to the permanent step: it
+/// said the item was left where it was, which stopped being known at that point.
+fn drop_sent_failures(report: &mut DeleteReport, sent: &[Target]) {
+    let sent: HashSet<&PathBuf> = sent.iter().map(|t| &t.path).collect();
+    report
+        .failed
+        .retain(|f| !(f.reason == FailReason::NotRecyclable && sent.contains(&f.path)));
+}
+
 /// `first` with the outcome of the permanent step in place of the `NotRecyclable`
 /// failure of each item that was sent to it. Items the user left out keep theirs.
 fn merge_permanent_step(
@@ -112,16 +121,20 @@ fn merge_permanent_step(
     sent: &[Target],
     second: DeleteReport,
 ) -> DeleteReport {
-    let sent: HashSet<&PathBuf> = sent.iter().map(|t| &t.path).collect();
-    first
-        .failed
-        .retain(|f| !(f.reason == FailReason::NotRecyclable && sent.contains(&f.path)));
+    drop_sent_failures(&mut first, sent);
     first.removed.extend(second.removed);
     first.recycled.extend(second.recycled);
     first.failed.extend(second.failed);
     first.bytes_freed += second.bytes_freed;
     first.bytes_in_bin += second.bytes_in_bin;
     first
+}
+
+/// `first` for a permanent step that panicked: the failures of the items sent to it
+/// no longer hold, so they come out, and the items are returned to be named as unknown.
+fn split_unknown(mut first: DeleteReport, sent: Vec<Target>) -> (DeleteReport, Vec<Target>) {
+    drop_sent_failures(&mut first, &sent);
+    (first, sent)
 }
 
 /// What is known after asking Windows to empty the bin. The system asks the user
@@ -157,8 +170,9 @@ pub enum DeleteFlow {
     ConfirmEmptyBin(DeleteReport, BinLoad),
     EmptyingBin(Job<BinEmptied>, DeleteReport),
     Emptied(DeleteReport, BinEmptied),
-    /// A delete job panicked. The report holds only what an earlier step proved.
-    OutcomeUnknown(DeleteReport),
+    /// A delete job panicked. The report holds only what an earlier step proved; the
+    /// targets were sent to the job that panicked, so nothing can be said about them.
+    OutcomeUnknown(DeleteReport, Vec<Target>),
 }
 
 impl DeleteFlow {
@@ -175,8 +189,21 @@ impl DeleteFlow {
     }
 
     pub fn outcome_unknown(&self) -> bool {
-        matches!(self, DeleteFlow::OutcomeUnknown(_))
+        matches!(self, DeleteFlow::OutcomeUnknown(..))
     }
+}
+
+/// Whether a request to close the window has to wait. Killing a delete or an emptying
+/// halfway can leave a guard file or an outcome nobody can tell.
+pub fn refuse_close(close_requested: bool, flow: &DeleteFlow) -> bool {
+    close_requested && flow.is_working()
+}
+
+pub fn close_refused_text() -> &'static str {
+    l(
+        "Katharistís stays open until this finishes. Closing it now could leave a file only at a temporary path, or an outcome nobody can tell.",
+        "Katharistís tetap terbuka sampai ini selesai. Menutupnya sekarang bisa meninggalkan file hanya di path sementara, atau hasil yang tidak bisa diketahui.",
+    )
 }
 
 /// Failures after which what the map shows may no longer match the disk. A
@@ -233,8 +260,8 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
             "{} {}",
             s.app_owned,
             l(
-                "of these items are used by an app: they are inside an installed app's or a browser's folder.",
-                "item di antaranya dipakai aplikasi: berada di dalam folder aplikasi terpasang atau browser.",
+                "of these items are used by an app: they are inside, or hold, an installed app's or a browser's folder.",
+                "item di antaranya dipakai aplikasi: berada di dalam, atau berisi, folder aplikasi terpasang atau browser.",
             )
         ));
     }
@@ -365,7 +392,7 @@ fn poll_flow(flow: &mut DeleteFlow) -> Option<DeleteReport> {
     match flow {
         DeleteFlow::Running(job) => match job.poll()? {
             Err(JobPanicked) => {
-                *flow = DeleteFlow::OutcomeUnknown(DeleteReport::default());
+                *flow = DeleteFlow::OutcomeUnknown(DeleteReport::default(), Vec::new());
                 None
             }
             Ok(report) => {
@@ -384,8 +411,9 @@ fn poll_flow(flow: &mut DeleteFlow) -> Option<DeleteReport> {
             let first = std::mem::take(first);
             match outcome {
                 Err(JobPanicked) => {
-                    *flow = DeleteFlow::OutcomeUnknown(first.clone());
-                    Some(first)
+                    let (proven, unknown) = split_unknown(first, std::mem::take(sent));
+                    *flow = DeleteFlow::OutcomeUnknown(proven.clone(), unknown);
+                    Some(proven)
                 }
                 Ok(second) => {
                     let merged = merge_permanent_step(first, sent, second);
@@ -485,7 +513,7 @@ fn apply_event(
             None
         }
         (
-            DeleteFlow::Report(_) | DeleteFlow::Emptied(..) | DeleteFlow::OutcomeUnknown(_),
+            DeleteFlow::Report(_) | DeleteFlow::Emptied(..) | DeleteFlow::OutcomeUnknown(..),
             FlowEvent::Dismiss,
         ) => None,
         (state, _) => {
@@ -721,12 +749,26 @@ fn render_emptied(ui: &mut egui::Ui, r: &DeleteReport, b: &BinEmptied) -> Option
     event
 }
 
-fn render_unknown(ui: &mut egui::Ui, proven: &DeleteReport) -> Option<FlowEvent> {
+fn render_unknown(
+    ui: &mut egui::Ui,
+    proven: &DeleteReport,
+    unknown: &[Target],
+) -> Option<FlowEvent> {
     ui.heading(l("Outcome unknown", "Hasil tidak diketahui"));
     ui.add_space(6.0);
     ui.label(unknown_outcome_text());
+    if !unknown.is_empty() {
+        ui.add_space(6.0);
+        ui.strong(l(
+            "Sent to delete permanently, outcome unknown:",
+            "Dikirim untuk dihapus permanen, hasil tidak diketahui:",
+        ));
+        path_list(ui, "unknown-items", unknown.len(), |i| {
+            unknown[i].path.display().to_string()
+        });
+    }
     let s = report_summary(proven);
-    if s.freed > 0 || s.in_bin > 0 {
+    if s.freed > 0 || s.offer_empty_bin || s.failed > 0 {
         ui.add_space(6.0);
         ui.weak(l(
             "Known from the step before it:",
@@ -761,7 +803,7 @@ fn render_flow(ctx: &egui::Context, flow: &mut DeleteFlow) -> Option<FlowEvent> 
             DeleteFlow::Report(r) => render_report(ui, r),
             DeleteFlow::ConfirmEmptyBin(_, load) => render_empty_bin(ui, load),
             DeleteFlow::Emptied(r, b) => render_emptied(ui, r, b),
-            DeleteFlow::OutcomeUnknown(proven) => render_unknown(ui, proven),
+            DeleteFlow::OutcomeUnknown(proven, unknown) => render_unknown(ui, proven, unknown),
             DeleteFlow::Running(_) | DeleteFlow::RunningPermanent(..) => {
                 render_busy(ui, l("Working...", "Sedang dikerjakan..."));
                 None
@@ -1175,7 +1217,58 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_freed, 0);
         assert_eq!(reports[0].recycled.len(), 1);
-        assert!(flow.outcome_unknown());
+        let big = PathBuf::from(r"C:\t\big");
+        // The ticked item may be partly or fully gone: nothing may still say it stayed.
+        assert!(reports[0].failed.iter().all(|f| f.path != big));
+        let DeleteFlow::OutcomeUnknown(proven, unknown) = &flow else {
+            panic!("expected the unknown outcome");
+        };
+        assert!(proven.failed.iter().all(|f| f.path != big));
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].path, big);
+        // What was not sent keeps its reason: left out, and in use.
+        let left: Vec<_> = proven.failed.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            left,
+            [PathBuf::from(r"C:\t\huge"), PathBuf::from(r"C:\t\open")]
+        );
+    }
+
+    #[test]
+    fn closing_is_refused_only_while_a_job_can_change_the_disk() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let job = Job::spawn(ctx.clone(), move || {
+            let _ = rx.recv();
+            DeleteReport::default()
+        });
+        let mut flow = DeleteFlow::Running(job);
+        assert!(refuse_close(true, &flow));
+        assert!(!refuse_close(false, &flow));
+        tx.send(()).unwrap();
+        settle(&mut flow);
+        assert!(!refuse_close(true, &flow));
+
+        let not_working = [
+            DeleteFlow::Idle,
+            DeleteFlow::Confirm(req(DeleteMode::RecycleBin, ConfirmContext::User)),
+            DeleteFlow::Report(DeleteReport::default()),
+            DeleteFlow::OutcomeUnknown(DeleteReport::default(), Vec::new()),
+        ];
+        for flow in &not_working {
+            assert!(!refuse_close(true, flow));
+        }
+
+        let empty = Job::spawn(ctx.clone(), || BinEmptied {
+            before: None,
+            after: None,
+            error: None,
+        });
+        let emptying = DeleteFlow::EmptyingBin(empty, DeleteReport::default());
+        assert!(refuse_close(true, &emptying));
+        let permanent = Job::spawn(ctx, DeleteReport::default);
+        let second = DeleteFlow::RunningPermanent(permanent, Vec::new(), DeleteReport::default());
+        assert!(refuse_close(true, &second));
     }
 
     #[test]
@@ -1300,7 +1393,7 @@ mod tests {
             DeleteFlow::Report(report()),
             DeleteFlow::ConfirmEmptyBin(report(), BinLoad::Known(None)),
             DeleteFlow::Emptied(report(), done),
-            DeleteFlow::OutcomeUnknown(report()),
+            DeleteFlow::OutcomeUnknown(report(), vec![t(r"C:\t\sent", 1)]),
         ];
         let name = |f: &DeleteFlow| std::mem::discriminant(f);
         for flow in &mut states {

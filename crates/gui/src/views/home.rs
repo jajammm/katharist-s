@@ -14,6 +14,7 @@ use katharistis_core::delete::{DeleteMode, DeleteReport, Target};
 use katharistis_core::format::format_size;
 use katharistis_core::other_space::{other_space, OtherSpace, SystemItem};
 use katharistis_core::protect::{is_protected, ProtectContext};
+use katharistis_core::recycle::is_guard_name;
 use katharistis_core::scan::{
     scan, EntryClass, Node, NodeId, ScanError, ScanOptions, ScanProgress, ScanTree,
 };
@@ -228,11 +229,13 @@ pub fn location_or_root(tree: &ScanTree, at: NodeId) -> NodeId {
 pub struct RowFlags {
     pub protected: bool,
     pub app_owned: bool,
+    /// A guard left by a recycle that went wrong; its data may be only here.
+    pub guard: bool,
 }
 
-/// A row gets a checkbox once it is known not to be protected.
+/// A row gets a checkbox once it is known to be neither protected nor a guard file.
 pub fn can_select(flags: Option<&RowFlags>) -> bool {
-    flags.is_some_and(|f| !f.protected)
+    flags.is_some_and(|f| !f.protected && !f.guard)
 }
 
 /// The confirmation for what is ticked. Anything that could not have a checkbox
@@ -390,7 +393,11 @@ pub fn scan_options(excluded: Vec<PathBuf>) -> ScanOptions {
 pub fn compute_flags(p: &Path, protect: &ProtectContext, marks: &UsageMarks) -> RowFlags {
     RowFlags {
         protected: is_protected(p, protect),
-        app_owned: marks.is_app_owned(p),
+        app_owned: marks.is_app_owned(p) || marks.contains_app_owned(p),
+        guard: p
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_guard_name),
     }
 }
 
@@ -633,9 +640,11 @@ impl HomeState {
         self.map_stale |= map_may_be_stale(report);
     }
 
-    /// A delete ended with an unknown outcome, so the map may be wrong.
+    /// A delete ended with an unknown outcome, so the map may be wrong and what is
+    /// ticked may be gone already. Sizes from here on would count space twice.
     pub fn mark_stale(&mut self) {
         self.map_stale = true;
+        self.selection.clear();
     }
 
     fn open_other_space(&mut self, ctx: &egui::Context, tree: &ScanTree) {
@@ -804,6 +813,12 @@ fn row_marks(node: &Node, flags: Option<&RowFlags>) -> String {
     if flags.is_some_and(|f| f.protected) {
         marks.push(l("protected", "dilindungi"));
     }
+    if flags.is_some_and(|f| f.guard) {
+        marks.push(l(
+            "guard file, may hold a file's data",
+            "file pengaman, mungkin berisi data file",
+        ));
+    }
     if node.class == EntryClass::Link {
         marks.push(l("link", "tautan"));
     }
@@ -834,6 +849,7 @@ fn draw_list(
     tree: &ScanTree,
     view: &mut LocationView,
     selection: &mut BTreeSet<NodeId>,
+    ticks_allowed: bool,
     marks: Option<&UsageMarks>,
     protect: &ProtectContext,
     stale_days: u32,
@@ -882,7 +898,8 @@ fn draw_list(
                     cell(ui, CHECK_WIDTH, row_height, false, |ui| {
                         if can_select(flags.as_ref()) {
                             let mut on = selection.contains(&id);
-                            if ui.checkbox(&mut on, "").changed() {
+                            let tick = egui::Checkbox::new(&mut on, "");
+                            if ui.add_enabled(ticks_allowed, tick).changed() {
                                 if on {
                                     selection.insert(id);
                                 } else {
@@ -1000,6 +1017,30 @@ fn draw_other_space(ui: &mut egui::Ui, other: &OtherLoad, cancelled: bool) {
     }
 }
 
+/// Whether a delete may be asked for. Not on a stale map: its sizes are what a report
+/// counts as freed, and after a partial delete they would count the same space again.
+fn can_delete(selection: &BTreeSet<NodeId>, marks_ready: bool, map_stale: bool) -> bool {
+    !selection.is_empty() && marks_ready && !map_stale
+}
+
+/// What a press of a delete button asks for, if it may ask for anything.
+fn delete_action(
+    tree: &ScanTree,
+    flags: &HashMap<NodeId, RowFlags>,
+    selection: &BTreeSet<NodeId>,
+    pressed: Option<DeleteMode>,
+    allowed: bool,
+) -> Option<HomeAction> {
+    pressed
+        .filter(|_| allowed)
+        .map(|mode| HomeAction::Delete(request_from_selection(tree, selection, flags, mode)))
+}
+
+/// The panel that explains used against scanned is about a whole drive.
+fn offers_gap_panel(tree: &ScanTree) -> bool {
+    is_drive_root(&tree.root_path)
+}
+
 /// The buttons that lead into a delete. Both only open the confirmation, and
 /// permanent is a separate button of its own, never a remembered setting.
 fn action_bar(
@@ -1008,9 +1049,10 @@ fn action_bar(
     view: &LocationView,
     selection: &BTreeSet<NodeId>,
     marks_ready: bool,
+    map_stale: bool,
 ) -> Option<HomeAction> {
     let total: u64 = selection.iter().map(|&id| tree.nodes[id].size).sum();
-    let can_delete = !selection.is_empty() && marks_ready;
+    let can_delete = can_delete(selection, marks_ready, map_stale);
     let pal = theme::palette(ui.visuals().dark_mode);
     let mut mode = None;
     ui.horizontal(|ui| {
@@ -1038,7 +1080,7 @@ fn action_bar(
             format_size(total)
         ));
     });
-    mode.map(|mode| HomeAction::Delete(request_from_selection(tree, selection, &view.flags, mode)))
+    delete_action(tree, &view.flags, selection, mode, can_delete)
 }
 
 /// Everything below the controls, once there is a tree.
@@ -1074,10 +1116,11 @@ fn body(
         ));
     }
     if st.map_stale {
+        st.selection.clear();
         ui.horizontal(|ui| {
             ui.label(l(
-                "The map may no longer match the disk.",
-                "Peta mungkin tidak lagi sesuai dengan disk.",
+                "The map may no longer match the disk. Scan again before deleting more.",
+                "Peta mungkin tidak lagi sesuai dengan disk. Pindai ulang sebelum menghapus lagi.",
             ));
             if ui.button(l("Scan again", "Pindai ulang")).clicked() {
                 action = Some(HomeAction::Scan(tree.root_path.clone()));
@@ -1109,6 +1152,15 @@ fn body(
         .unwrap_or_else(|| LocationView::build(tree, location, protect));
     let marks = st.marks.as_ref();
     let mut tile_action = None;
+    let mut open_gap = false;
+    if offers_gap_panel(tree) && st.pane != Pane::OtherSpace {
+        open_gap = ui
+            .button(l(
+                "Why doesn't this add up?",
+                "Kenapa jumlahnya tidak sama?",
+            ))
+            .clicked();
+    }
     match st.pane {
         Pane::OtherSpace => {
             if ui.button(l("Back to map", "Kembali ke peta")).clicked() {
@@ -1140,6 +1192,7 @@ fn body(
                 tree,
                 &mut view,
                 &mut st.selection,
+                !st.map_stale,
                 marks,
                 protect,
                 stale_days,
@@ -1147,7 +1200,14 @@ fn body(
             );
             go = go.or(enter);
             ui.add_space(4.0);
-            action = action.or(action_bar(ui, tree, &view, &st.selection, marks.is_some()));
+            action = action.or(action_bar(
+                ui,
+                tree,
+                &view,
+                &st.selection,
+                marks.is_some(),
+                st.map_stale,
+            ));
         }
     }
     st.view = Some(view);
@@ -1157,6 +1217,9 @@ fn body(
         Some(TileAction::OtherSpace) => st.open_other_space(ui.ctx(), tree),
         Some(TileAction::FullList) => st.pane = Pane::FullList,
         Some(TileAction::Nothing) | None => {}
+    }
+    if open_gap {
+        st.open_other_space(ui.ctx(), tree);
     }
     if let Some(id) = go {
         st.go_to(id);
@@ -1502,11 +1565,13 @@ mod tests {
         assert!(!can_select(None));
         assert!(!can_select(Some(&RowFlags {
             protected: true,
-            app_owned: false
+            app_owned: false,
+            guard: false,
         })));
         assert!(can_select(Some(&RowFlags {
             protected: false,
-            app_owned: true
+            app_owned: true,
+            guard: false,
         })));
     }
 
@@ -1516,14 +1581,17 @@ mod tests {
         let plain = RowFlags {
             protected: false,
             app_owned: false,
+            guard: false,
         };
         let owned = RowFlags {
             protected: false,
             app_owned: true,
+            guard: false,
         };
         let shielded = RowFlags {
             protected: true,
             app_owned: true,
+            guard: false,
         };
         let flags = HashMap::from([(1, owned), (4, plain), (3, shielded)]);
         // 2 has no flags yet, 3 is protected: neither may reach the request.
@@ -1769,6 +1837,143 @@ mod tests {
         run_frame(&ctx_ui, &mut |ui| {
             assert!(show(ui, &mut st, Some(&t), 365, &c).is_none());
         });
+    }
+
+    #[test]
+    fn a_stale_map_yields_no_delete_action() {
+        let t = tree_at(r"C:\t");
+        let plain = RowFlags {
+            protected: false,
+            app_owned: false,
+            guard: false,
+        };
+        let flags = HashMap::from([(1, plain)]);
+        let sel = BTreeSet::from([1]);
+        assert!(can_delete(&sel, true, false));
+        assert!(!can_delete(&sel, true, true));
+        assert!(!can_delete(&sel, false, false));
+        assert!(!can_delete(&BTreeSet::new(), true, false));
+        for mode in [DeleteMode::RecycleBin, DeleteMode::Permanent] {
+            let allowed = can_delete(&sel, true, true);
+            assert!(delete_action(&t, &flags, &sel, Some(mode), allowed).is_none());
+            let allowed = can_delete(&sel, true, false);
+            assert!(matches!(
+                delete_action(&t, &flags, &sel, Some(mode), allowed),
+                Some(HomeAction::Delete(_))
+            ));
+            assert!(delete_action(&t, &flags, &sel, None, allowed).is_none());
+        }
+    }
+
+    #[test]
+    fn a_stale_map_drops_ticks_and_asks_for_nothing() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = t.root;
+        st.selection.insert(1);
+        // A first-step panic: no report arrives, so only this reaches the ticks.
+        st.mark_stale();
+        assert!(st.selection.is_empty());
+        st.selection.insert(1);
+        run_frame(&ctx_ui, &mut |ui| {
+            assert!(show(ui, &mut st, Some(&t), 365, &c).is_none());
+        });
+        assert!(st.selection.is_empty());
+        assert!(st.map_stale);
+    }
+
+    #[test]
+    fn a_partial_failure_stops_the_retry_that_would_count_twice() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let mut t = tree_at(r"C:\t");
+        let mut st = state(&ctx_ui, &c);
+        st.location = t.root;
+        let partial = DeleteReport {
+            failed: vec![Failed {
+                path: PathBuf::from(r"C:\t\a"),
+                size: 120,
+                reason: FailReason::InUse,
+            }],
+            bytes_freed: 100,
+            ..Default::default()
+        };
+        st.after_report(&mut t, &partial);
+        assert!(st.map_stale);
+        assert!(!can_delete(&BTreeSet::from([1]), true, st.map_stale));
+    }
+
+    #[test]
+    fn guard_rows_have_no_checkbox_and_a_plain_mark() {
+        let c = ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let guard = dir.path().join(".katharistis-guard-123-0");
+        let flags = compute_flags(&guard, &c, &UsageMarks::default());
+        assert!(flags.guard);
+        assert!(!flags.protected);
+        assert!(!can_select(Some(&flags)));
+        assert!(!compute_flags(&dir.path().join("a.bin"), &c, &UsageMarks::default()).guard);
+
+        let n = node(".katharistis-guard-123-0", 5, EntryClass::File, Some(0));
+        assert!(row_marks(&n, Some(&flags)).contains("guard file"));
+
+        // Not through a stale selection either.
+        let t = tree_at(r"C:\t");
+        let by_id = HashMap::from([(4, flags)]);
+        let req = request_from_selection(&t, &BTreeSet::from([4]), &by_id, DeleteMode::Permanent);
+        assert!(req.items.is_empty());
+    }
+
+    #[test]
+    fn a_folder_holding_an_install_is_marked_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let games = dir.path().join("Games");
+        let entry = katharistis_core::apps::AppEntry {
+            key: "k".into(),
+            name: "App".into(),
+            publisher: None,
+            version: None,
+            install_date: None,
+            size: 0,
+            install_location: Some(games.join("App")),
+            uninstall: None,
+        };
+        let c = ctx();
+        let marks = UsageMarks::with_context(&[entry], Vec::new(), &c);
+        let holding = compute_flags(&games, &c, &marks);
+        assert!(holding.app_owned);
+        assert!(can_select(Some(&holding)));
+        assert!(!compute_flags(&dir.path().join("Gam"), &c, &marks).app_owned);
+
+        let t = tree_at(r"C:\t");
+        let by_id = HashMap::from([(1, holding)]);
+        let req = request_from_selection(&t, &BTreeSet::from([1]), &by_id, DeleteMode::RecycleBin);
+        assert_eq!(req.warn_app_owned, 1);
+        let hover = hover_lines("n", 1, None, false, holding.app_owned).join("\n");
+        assert!(hover.contains("used by an app"));
+    }
+
+    #[test]
+    fn the_gap_button_is_there_for_any_drive_scan_and_no_folder_scan() {
+        assert!(offers_gap_panel(&tree_at(r"C:\")));
+        assert!(!offers_gap_panel(&tree_at(r"C:\t")));
+    }
+
+    #[test]
+    fn the_gap_panel_opens_without_losing_the_place_or_the_ticks() {
+        let ctx_ui = egui::Context::default();
+        let c = ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let t = tree_at(dir.path().to_str().unwrap());
+        let mut st = state(&ctx_ui, &c);
+        st.location = 1;
+        st.selection.insert(2);
+        st.open_other_space(&ctx_ui, &t);
+        assert_eq!(st.pane, Pane::OtherSpace);
+        assert_eq!(st.location, 1);
+        assert!(st.selection.contains(&2));
     }
 
     #[test]

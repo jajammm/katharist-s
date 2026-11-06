@@ -86,6 +86,13 @@ impl UsageMarks {
     pub fn is_app_owned(&self, p: &Path) -> bool {
         canonical_key(p).is_some_and(|key| self.roots.iter().any(|r| key_at_or_under(&key, r)))
     }
+
+    /// Whether `p` holds an install location or browser profile further down, so
+    /// that deleting it takes the app along. Only usable roots ever get this far.
+    /// `false` for a path that has no canonical key.
+    pub fn contains_app_owned(&self, p: &Path) -> bool {
+        canonical_key(p).is_some_and(|key| self.roots.iter().any(|r| key_at_or_under(r, &key)))
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +206,33 @@ mod tests {
         assert!(m.roots.is_empty(), "{:?}", m.roots);
         assert!(!m.is_app_owned(Path::new(r"C:\Anything\x")));
         assert!(!m.is_app_owned(&docs.join("save.dat")));
+    }
+
+    #[test]
+    fn a_folder_holding_an_install_is_marked_by_whole_component() {
+        let t = tempdir().unwrap();
+        let c = ctx(t.path());
+        let app_dir = PathBuf::from(r"C:\Games\App");
+        let m = UsageMarks::with_context(&[app(Some(&app_dir))], vec![], &c);
+        assert!(m.contains_app_owned(Path::new(r"C:\Games")));
+        assert!(m.contains_app_owned(Path::new(r"c:/games/")));
+        assert!(!m.contains_app_owned(Path::new(r"C:\Gam")));
+        // The install counts as holding itself; what is inside it holds nothing.
+        assert!(m.contains_app_owned(&app_dir));
+        assert!(!m.contains_app_owned(&app_dir.join("x")));
+        assert!(!m.contains_app_owned(Path::new(r"C:\Other")));
+        assert!(!m.contains_app_owned(Path::new(r"relative\Games")));
+    }
+
+    #[test]
+    fn unusable_roots_mark_no_folder_above_them() {
+        let t = tempdir().unwrap();
+        let c = ctx(t.path());
+        let docs = c.profile.join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        let m = UsageMarks::with_context(&[app(Some(&docs))], vec![], &c);
+        assert!(!m.contains_app_owned(&c.profile));
+        assert!(!m.contains_app_owned(&c.users_dir));
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub struct App {
     protect: ProtectContext,
     home: HomeState,
     flow: DeleteFlow,
+    /// A close was refused and the job it waited for is still running.
+    close_refused: bool,
 }
 
 impl App {
@@ -58,6 +60,7 @@ impl App {
             protect,
             home,
             flow: DeleteFlow::Idle,
+            close_refused: false,
         };
         app.apply_language();
         app.apply_theme(&cc.egui_ctx);
@@ -98,6 +101,29 @@ impl App {
         if was_working && !self.flow.is_working() {
             self.home.refresh_space(ctx);
             self.drive_job = Some(Job::spawn(ctx.clone(), system_drive));
+        }
+        self.guard_close(ctx);
+    }
+
+    /// Keeps the window open while a job that can change the disk runs.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        if confirm::refuse_close(requested, &self.flow) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_refused = true;
+        }
+        self.close_refused &= self.flow.is_working();
+        if self.close_refused {
+            egui::Area::new(egui::Id::unique("close-refused"))
+                .order(egui::Order::Tooltip)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(460.0);
+                        ui.label(confirm::close_refused_text());
+                    });
+                });
         }
     }
 
