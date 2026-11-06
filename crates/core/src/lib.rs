@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod apps;
 pub mod delete;
 pub mod dupes;
 pub mod format;
