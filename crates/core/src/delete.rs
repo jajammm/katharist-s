@@ -262,7 +262,7 @@ pub fn delete(targets: &[Target], mode: DeleteMode, ctx: &ProtectContext) -> Del
 mod tests {
     use super::*;
     use crate::protect::canonical_for_delete;
-    use crate::recycle::{bin_info, recycle_with_unknown_quota};
+    use crate::recycle::{bin_info, recycle_with_unknown_quota, RESTORED};
     use crate::{scan, win};
     use std::fs;
     use std::io::{Read, Write};
@@ -979,6 +979,10 @@ mod tests {
             bin_info().unwrap()
         );
         assert_eq!(outcome, Err(FailReason::NotRecyclable));
+        assert!(
+            RESTORED.lock().unwrap().contains(&f),
+            "the shell must really have deleted it and the guard restored it"
+        );
         let meta = fs::metadata(&f).unwrap();
         assert_eq!(meta.len(), logical);
         assert_ne!(meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0);
@@ -1005,6 +1009,10 @@ mod tests {
 
         eprintln!("guard on a file with two names: {outcome:?}");
         assert_eq!(outcome, Err(FailReason::NotRecyclable));
+        assert!(
+            RESTORED.lock().unwrap().contains(&f),
+            "the shell must really have deleted it and the guard restored it"
+        );
         assert_eq!(fs::metadata(&f).unwrap().len(), logical);
         assert!(other.exists());
         assert_eq!(win::link_info(&f).unwrap().2, 2);

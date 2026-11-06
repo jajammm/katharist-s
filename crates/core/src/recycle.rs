@@ -441,6 +441,11 @@ fn read_bin_settings(p: &Path) -> BinSettings {
     }
 }
 
+/// What the guard has put back. A file the shell never touched looks the same
+/// afterwards, so this is how a test knows the restore really ran.
+#[cfg(test)]
+pub(crate) static RESTORED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// A second name for a file, created beside it for the length of the shell call.
 /// What the shell does to the original name cannot reach the data while this name
 /// exists, so a file the shell deletes for good can be put back.
@@ -532,7 +537,14 @@ impl Guard {
                 if reason_from_os_code(e.raw_os_error().unwrap_or(0)) == FailReason::NotFound =>
             {
                 match win::rename_no_replace(&self.path, &self.restore_to) {
-                    Ok(()) => outcome.and(Err(FailReason::NotRecyclable)),
+                    Ok(()) => {
+                        #[cfg(test)]
+                        RESTORED
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(self.restore_to.clone());
+                        outcome.and(Err(FailReason::NotRecyclable))
+                    }
                     Err(_) => kept("the shell deleted the file and it could not be restored"),
                 }
             }
