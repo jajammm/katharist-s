@@ -24,7 +24,7 @@ Berkas yang dipindahkan ke Recycle Bin belum mengembalikan ruang disk. Laporan m
 
 Berkas yang tidak bisa masuk Recycle Bin (melebihi kuota, drive tanpa Recycle Bin, atau folder yang berisi link) tidak pernah dihapus begitu saja. Hapus permanen hanya terjadi setelah konfirmasi terpisah.
 
-Berkas boot di akar drive Windows (`bootmgr`, `BOOTNXT`, `Boot`, `Recovery`, `EFI`) dilindungi dan tidak bisa dihapus dari sini, begitu juga folder sistem seperti `C:Windows`.
+Berkas boot di akar drive Windows (`bootmgr`, `BOOTNXT`, `Boot`, `Recovery`, `EFI`) dilindungi dan tidak bisa dihapus dari sini, begitu juga folder sistem seperti `C:\Windows`.
 
 ## CLI
 
