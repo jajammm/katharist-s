@@ -119,12 +119,16 @@ pub fn render(
             format_size(free)
         );
     }
-    if !tree.errors.is_empty() {
+    let restricted = tree.errors.iter().filter(|e| e.is_access_denied()).count();
+    let problems = tree.errors.len() - restricted;
+    if restricted > 0 {
         let _ = writeln!(
             out,
-            "⚠️  {} item tidak bisa dibaca (akses ditolak). Coba jalankan sebagai administrator.",
-            tree.errors.len()
+            "ℹ️  {restricted} folder butuh hak administrator, jadi isinya tidak terhitung."
         );
+    }
+    if problems > 0 {
+        let _ = writeln!(out, "⚠️  {problems} item gagal dibaca.");
     }
     out
 }
@@ -260,21 +264,22 @@ mod tests {
             files: 0,
         };
         let clean = render(&tree, &opts, None, secs(1));
-        assert!(!clean.contains("ditolak"), "{clean}");
+        assert!(!clean.contains("administrator"), "{clean}");
+        assert!(!clean.contains("gagal dibaca"), "{clean}");
 
-        tree.errors = vec![
-            ScanError {
-                path: "C:/data/a".into(),
-                reason: "denied".into(),
-            },
-            ScanError {
-                path: "C:/data/b".into(),
-                reason: "denied".into(),
-            },
-        ];
+        let error = |path: &str, code: i32| ScanError {
+            path: path.into(),
+            reason: std::io::Error::from_raw_os_error(code).to_string(),
+        };
+        tree.errors = vec![error("C:/data/a", 5), error("C:/data/b", -2147024891)];
         let s = render(&tree, &opts, None, secs(1));
-        assert!(s.contains("2 item tidak bisa dibaca"), "{s}");
-        assert!(s.contains("ditolak"), "{s}");
+        assert!(s.contains("2 folder butuh hak administrator"), "{s}");
+        assert!(!s.contains("gagal dibaca"), "{s}");
+
+        tree.errors.push(error("C:/data/c", 1117));
+        let s = render(&tree, &opts, None, secs(1));
+        assert!(s.contains("2 folder butuh hak administrator"), "{s}");
+        assert!(s.contains("1 item gagal dibaca"), "{s}");
     }
 
     #[test]

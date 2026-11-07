@@ -1156,7 +1156,38 @@ fn draw_list(
     enter
 }
 
-fn unreadable_list(ui: &mut egui::Ui, salt: &str, errors: &[ScanError]) {
+/// Folders Windows restricts to admins first, then real read failures. Only the
+/// second kind is something for the user to look into.
+fn split_unreadable(errors: &[ScanError]) -> (Vec<&ScanError>, Vec<&ScanError>) {
+    errors.iter().partition(|e| e.is_access_denied())
+}
+
+/// A drive scan explains restricted folders in its gap panel. A folder scan has
+/// no such panel, so it says it where the user is.
+fn notes_restricted_on_home(tree: &ScanTree, restricted: usize) -> bool {
+    restricted > 0 && !offers_gap_panel(tree)
+}
+
+fn restricted_heading(count: usize) -> String {
+    format!(
+        "{} {count}",
+        l(
+            "Folders that need administrator rights:",
+            "Folder yang butuh hak administrator:"
+        )
+    )
+}
+
+fn unreadable_line(e: &ScanError) -> String {
+    let reason = if e.is_access_denied() {
+        l("needs administrator rights", "butuh hak administrator")
+    } else {
+        e.reason.as_str()
+    };
+    format!("{}: {reason}", e.path.display())
+}
+
+fn unreadable_list(ui: &mut egui::Ui, salt: &str, errors: &[&ScanError]) {
     let height = ui.text_style_height(&egui::TextStyle::Body);
     egui::ScrollArea::vertical()
         .id_salt(salt)
@@ -1164,8 +1195,7 @@ fn unreadable_list(ui: &mut egui::Ui, salt: &str, errors: &[ScanError]) {
         .auto_shrink([false, true])
         .show_rows(ui, height, errors.len(), |ui, range| {
             for e in &errors[range] {
-                let line = format!("{}: {}", e.path.display(), e.reason);
-                ui.add(egui::Label::new(line).truncate());
+                ui.add(egui::Label::new(unreadable_line(e)).truncate());
             }
         });
 }
@@ -1211,14 +1241,24 @@ fn draw_other_space(ui: &mut egui::Ui, other: &OtherLoad, cancelled: bool) {
             for item in &o.system_files {
                 ui.label(system_item_line(item));
             }
-            if !o.unreadable.is_empty() {
+            let (restricted, problems) = split_unreadable(&o.unreadable);
+            if !restricted.is_empty() {
+                ui.add_space(8.0);
+                ui.strong(restricted_heading(restricted.len()));
+                ui.label(l(
+                    "Windows lets only administrators read these. This app runs without admin rights, so what they hold is part of the gap above. Nothing is wrong.",
+                    "Windows hanya mengizinkan administrator membaca folder ini. Aplikasi ini berjalan tanpa hak admin, jadi isinya termasuk selisih di atas. Tidak ada yang salah.",
+                ));
+                unreadable_list(ui, "other-restricted", &restricted);
+            }
+            if !problems.is_empty() {
                 ui.add_space(8.0);
                 ui.strong(format!(
                     "{} {}",
                     l("Could not be read:", "Tidak terbaca:"),
-                    o.unreadable.len()
+                    problems.len()
                 ));
-                unreadable_list(ui, "other-unreadable", &o.unreadable);
+                unreadable_list(ui, "other-unreadable", &problems);
             }
             ui.add_space(8.0);
             ui.weak(l(
@@ -1349,16 +1389,26 @@ fn body(
             "Daftar aplikasi tidak terbaca, jadi tanda \"dipakai aplikasi\" tidak ada.",
         ));
     }
-    if !tree.errors.is_empty() && st.pane != Pane::OtherSpace {
-        egui::CollapsingHeader::new(format!(
-            "{} {}",
-            l("Could not be read:", "Tidak terbaca:"),
-            tree.errors.len()
-        ))
-        .id_salt("home-unreadable")
-        .show(ui, |ui| {
-            unreadable_list(ui, "home-unreadable-list", &tree.errors)
-        });
+    if st.pane != Pane::OtherSpace {
+        let (restricted, problems) = split_unreadable(&tree.errors);
+        if !problems.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "{} {}",
+                l("Could not be read:", "Tidak terbaca:"),
+                problems.len()
+            ))
+            .id_salt("home-unreadable")
+            .show(ui, |ui| {
+                unreadable_list(ui, "home-unreadable-list", &problems)
+            });
+        }
+        if notes_restricted_on_home(tree, restricted.len()) {
+            egui::CollapsingHeader::new(restricted_heading(restricted.len()))
+                .id_salt("home-restricted")
+                .show(ui, |ui| {
+                    unreadable_list(ui, "home-restricted-list", &restricted)
+                });
+        }
     }
 
     let mut view = st
@@ -1569,6 +1619,38 @@ mod tests {
     }
 
     /// `C:\t` holding `a\x` (100), `a\y` (20), `b` (10).
+    fn os_error(path: &str, code: i32) -> ScanError {
+        ScanError {
+            path: PathBuf::from(path),
+            reason: std::io::Error::from_raw_os_error(code).to_string(),
+        }
+    }
+
+    #[test]
+    fn restricted_folders_are_told_apart_from_read_failures() {
+        let errors = [
+            os_error(r"C:\Windows\Temp", -2147024891),
+            os_error(r"C:\data\bad", 1117),
+            os_error(r"C:\Recovery", 5),
+        ];
+        let (restricted, problems) = split_unreadable(&errors);
+        assert_eq!(restricted.len(), 2);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].path.ends_with("bad"));
+        assert!(unreadable_line(restricted[0]).contains("administrator"));
+        assert!(!unreadable_line(restricted[0]).contains("os error"));
+        assert!(unreadable_line(problems[0]).contains("os error 1117"));
+    }
+
+    #[test]
+    fn restricted_folders_stay_off_home_on_a_drive_scan_only() {
+        let drive = tree_at(r"C:\");
+        let folder = tree_at(r"C:\t");
+        assert!(!notes_restricted_on_home(&drive, 610));
+        assert!(notes_restricted_on_home(&folder, 3));
+        assert!(!notes_restricted_on_home(&folder, 0));
+    }
+
     fn tree_at(root: &str) -> ScanTree {
         let mut nodes = vec![
             node("t", 130, EntryClass::Dir, None),

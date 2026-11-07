@@ -83,6 +83,16 @@ pub struct ScanError {
     pub reason: String,
 }
 
+impl ScanError {
+    /// Windows refused access, which is expected for system folders when running
+    /// without admin rights, unlike a real read failure. `reason` comes from
+    /// `io::Error`, whose code stays the same in every Windows language.
+    pub fn is_access_denied(&self) -> bool {
+        const DENIED: [&str; 2] = ["(os error 5)", "(os error -2147024891)"];
+        DENIED.iter().any(|code| self.reason.contains(code))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanTree {
     pub nodes: Vec<Node>,
@@ -492,6 +502,20 @@ mod tests {
     }
 
     #[test]
+    fn only_a_refusal_counts_as_access_denied() {
+        let error = |code: i32| ScanError {
+            path: PathBuf::from(r"C:\x"),
+            reason: io::Error::from_raw_os_error(code).to_string(),
+        };
+        // Win32 code, and the HRESULT form the windows crate produces.
+        assert!(error(5).is_access_denied());
+        assert!(error(-2147024891).is_access_denied());
+        // A disk error and a code that merely starts with 5.
+        assert!(!error(1117).is_access_denied());
+        assert!(!error(50).is_access_denied());
+    }
+
+    #[test]
     fn size_comes_from_the_directory_unless_it_cannot_tell() {
         const NORMAL: u32 = 0x20;
         const COMPRESSED: u32 = 0x800;
@@ -688,6 +712,7 @@ mod tests {
         let t = run(dir.path());
         assert_eq!(t.errors.len(), 1);
         assert!(t.errors[0].path.ends_with("locked"));
+        assert!(t.errors[0].is_access_denied(), "{}", t.errors[0].reason);
         assert!(t.nodes[t.root].size >= 4096);
         assert_eq!(t.files, 1);
     }
