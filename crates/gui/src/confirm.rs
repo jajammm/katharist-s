@@ -1236,6 +1236,7 @@ pub fn show_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::test_support::text_rect;
     use katharistis_core::delete::Failed;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -2038,16 +2039,6 @@ mod tests {
             bytes_freed: 1,
             bytes_in_bin: 1,
         }
-    }
-
-    /// Where the button or label with exactly this text was drawn, if it was.
-    fn text_rect(out: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
-        out.shapes.iter().find_map(|clipped| match &clipped.shape {
-            egui::Shape::Text(shape) if shape.galley.text() == text => {
-                Some(egui::Rect::from_min_size(shape.pos, shape.galley.size()))
-            }
-            _ => None,
-        })
     }
 
     #[test]

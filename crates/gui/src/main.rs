@@ -2,6 +2,7 @@
 
 mod app;
 mod confirm;
+mod fonts;
 mod i18n;
 mod jobs;
 mod theme;

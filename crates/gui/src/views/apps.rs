@@ -4,7 +4,7 @@
 //! unticked, and are deleted through the shared flow in `confirm`.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use katharistis_core::apps::leftovers::{find_leftovers, Certainty, Leftover, LeftoverRoots};
 use katharistis_core::apps::registry::{list_installed, still_registered, NaiveDateLike};
@@ -17,6 +17,7 @@ use katharistis_core::apps::winget::{
 use katharistis_core::apps::AppEntry;
 use katharistis_core::delete::{DeleteMode, DeleteReport, Target};
 use katharistis_core::format::format_size;
+use katharistis_core::protect::{canonical_key, ProtectContext};
 
 use crate::confirm::{ConfirmContext, ConfirmRequest};
 use crate::i18n::l;
@@ -39,6 +40,9 @@ pub struct Pending {
     /// `None` for an app only winget knows: there is no registry key to check.
     pub entry: Option<AppEntry>,
     pub method: Method,
+    /// winget's package for this app, whichever method runs: the list winget gave
+    /// stays in memory and has to hear about what this run did to the app.
+    pub winget_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -83,6 +87,64 @@ pub struct Row {
     pub official: Option<UninstallCmd>,
     /// Set only when winget's package is this app's, not an ambiguous guess.
     pub winget_id: Option<String>,
+    /// Installed somewhere other than Program Files. A mark only, nothing is refused.
+    pub outside_program_files: bool,
+}
+
+/// Whether an install location lies outside Program Files. A row with no location
+/// says nothing about where the app is, and neither does one that names no place.
+pub fn outside_program_files(location: Option<&Path>, program_files: &[PathBuf]) -> bool {
+    let Some(location) = location else {
+        return false;
+    };
+    // Installers do write this value with quotes around it.
+    let text = location.to_string_lossy();
+    let Some(key) = canonical_key(Path::new(text.trim().trim_matches('"'))) else {
+        return false;
+    };
+    !program_files
+        .iter()
+        .filter_map(|dir| canonical_key(dir))
+        .any(|dir| Path::new(&key).starts_with(dir))
+}
+
+fn drop_package(packages: &mut Vec<WingetPackage>, id: &str) {
+    packages.retain(|p| p.id != id);
+}
+
+/// Brings what winget said earlier in line with a finished run, so the next merge
+/// shows the app as it is now. A package of an app that is gone would come back as a
+/// row of its own; one that was updated would still offer the update.
+pub fn packages_after_run(
+    packages: &mut Vec<WingetPackage>,
+    p: &Pending,
+    end: &RunEnd,
+    registered: bool,
+) {
+    let (RunEnd::Done(code), Some(id)) = (end, &p.winget_id) else {
+        return;
+    };
+    let succeeded = *code == Some(0);
+    match p.method {
+        Method::WingetUpgrade(_) => {
+            if let Some(package) = packages
+                .iter_mut()
+                .find(|q| &q.id == id)
+                .filter(|_| succeeded)
+            {
+                if let Some(version) = package.available.take() {
+                    package.version = version;
+                }
+            }
+        }
+        Method::WingetUninstall(_) | Method::Uninstaller(_) => {
+            let key_gone = p.entry.is_some() && !registered;
+            let winget_done = succeeded && matches!(p.method, Method::WingetUninstall(_));
+            if key_gone || winget_done {
+                drop_package(packages, id);
+            }
+        }
+    }
 }
 
 /// The phase once the process ended. The app is gone from the registry only when
@@ -259,10 +321,18 @@ pub fn check_winget(
     WingetCheck::Ok(packages, note)
 }
 
-pub fn build_rows(rows: Vec<AppRow>, exists: &dyn Fn(&str) -> bool) -> Vec<Row> {
+pub fn build_rows(
+    rows: Vec<AppRow>,
+    exists: &dyn Fn(&str) -> bool,
+    program_files: &[PathBuf],
+) -> Vec<Row> {
     rows.into_iter()
         .map(|r| match r {
             AppRow::Registry(e, p) => Row {
+                outside_program_files: outside_program_files(
+                    e.install_location.as_deref(),
+                    program_files,
+                ),
                 name: e.name.clone(),
                 publisher: e.publisher.clone(),
                 size: e.size,
@@ -290,6 +360,7 @@ pub fn build_rows(rows: Vec<AppRow>, exists: &dyn Fn(&str) -> bool) -> Vec<Row> 
                 entry: None,
                 official: None,
                 winget_id: Some(p.id),
+                outside_program_files: false,
             },
         })
         .collect()
@@ -301,6 +372,7 @@ impl Row {
             name: self.name.clone(),
             entry: self.entry.clone(),
             method,
+            winget_id: self.winget_id.clone(),
         }
     }
 }
@@ -501,7 +573,12 @@ impl AppsState {
         }
         let packages = self.packages.clone();
         self.load = Some(Job::spawn(ctx.clone(), move || {
-            build_rows(merge(list_installed(), packages), &is_abs_file)
+            let program_files = ProtectContext::from_env().program_files;
+            build_rows(
+                merge(list_installed(), packages),
+                &is_abs_file,
+                &program_files,
+            )
         }));
     }
 
@@ -605,6 +682,7 @@ impl AppsState {
                     let ran = matches!(done.end, RunEnd::Done(_));
                     self.note = (!line.is_empty()).then_some(line);
                     if ran {
+                        packages_after_run(&mut self.packages, &p, &done.end, done.registered);
                         self.marks_dirty = !matches!(p.method, Method::WingetUpgrade(_));
                         self.reload(ctx);
                     }
@@ -638,6 +716,9 @@ impl AppsState {
             ) {
                 let phase = next_after_exit(&key, &|_| registered);
                 if phase != AppsPhase::Waiting(key) {
+                    if let Some(id) = self.current.as_ref().and_then(|p| p.winget_id.as_ref()) {
+                        drop_package(&mut self.packages, id);
+                    }
                     self.marks_dirty = true;
                     self.reload(ctx);
                 }
@@ -693,17 +774,29 @@ impl AppsState {
     }
 }
 
-const NAME_W: f32 = 230.0;
-const PUBLISHER_W: f32 = 150.0;
-const SIZE_W: f32 = 76.0;
-const DATE_W: f32 = 84.0;
-const VERSION_W: f32 = 90.0;
-const UPDATE_W: f32 = 90.0;
+/// The buttons come first so a row can always be acted on: the default window shows
+/// about 740 points of this table and the rest scrolls sideways.
+const ACTIONS_W: f32 = 250.0;
+const NAME_W: f32 = 190.0;
+const WHERE_W: f32 = 130.0;
+const PUBLISHER_W: f32 = 120.0;
+const SIZE_W: f32 = 70.0;
+const DATE_W: f32 = 80.0;
+const VERSION_W: f32 = 70.0;
+const UPDATE_W: f32 = 70.0;
+const TABLE_W: f32 =
+    ACTIONS_W + NAME_W + WHERE_W + PUBLISHER_W + SIZE_W + DATE_W + VERSION_W + UPDATE_W + 7.0 * 8.0;
+
+fn outside_mark() -> &'static str {
+    l("outside Program Files", "di luar Program Files")
+}
 
 fn header(ui: &mut egui::Ui, h: f32) {
     ui.horizontal(|ui| {
         for (w, text, right) in [
+            (ACTIONS_W, "", false),
             (NAME_W, l("Name", "Nama"), false),
+            (WHERE_W, l("Location", "Lokasi"), false),
             (PUBLISHER_W, l("Publisher", "Penerbit"), false),
             (SIZE_W, l("Size", "Ukuran"), true),
             (DATE_W, l("Installed", "Dipasang"), false),
@@ -996,21 +1089,70 @@ fn list(ui: &mut egui::Ui, state: &mut AppsState) {
         state.order_key = Some(key);
     }
     let h = ui.spacing().interact_size.y + 4.0;
-    header(ui, h);
+    // The header's place is taken now, and it is drawn after the rows, when it is known
+    // how far they scrolled sideways, so the two never part by a frame.
+    let (header_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     ui.separator();
     let busy = state.phase().busy() || state.run.is_some() || state.find.is_some();
     let mut chosen: Option<Pending> = None;
     let order = &state.order;
     let rows = &state.rows;
-    egui::ScrollArea::both()
+    let scrolled = egui::ScrollArea::both()
         .id_salt("apps-list")
         .auto_shrink([false, false])
         .show_rows(ui, h, order.len(), |ui, range| {
             for &i in &order[range] {
                 let row = &rows[i];
                 ui.horizontal(|ui| {
+                    cell(ui, ACTIONS_W, h, false, |ui| {
+                        if let Some(cmd) = &row.official {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new(l("Uninstall", "Uninstall")))
+                                .clicked()
+                            {
+                                chosen = Some(row.pending(Method::Uninstaller(cmd.clone())));
+                            }
+                        }
+                        if let Some(id) = &row.winget_id {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(l("via winget", "lewat winget")),
+                                )
+                                .on_hover_text(l(
+                                    "Uninstall with winget",
+                                    "Uninstall dengan winget",
+                                ))
+                                .clicked()
+                            {
+                                chosen = Some(row.pending(Method::WingetUninstall(id.clone())));
+                            }
+                            if row.available.is_some()
+                                && ui
+                                    .add_enabled(!busy, egui::Button::new(l("Update", "Perbarui")))
+                                    .clicked()
+                            {
+                                chosen = Some(row.pending(Method::WingetUpgrade(id.clone())));
+                            }
+                        }
+                        if row.official.is_none() && row.winget_id.is_none() {
+                            let text = egui::RichText::new(l(
+                                "Cannot be uninstalled from here.",
+                                "Tidak bisa di-uninstall dari sini.",
+                            ))
+                            .weak();
+                            ui.add(egui::Label::new(text).truncate());
+                        }
+                    });
                     cell(ui, NAME_W, h, false, |ui| {
                         ui.add(egui::Label::new(row.name.as_str()).truncate());
+                    });
+                    cell(ui, WHERE_W, h, false, |ui| {
+                        if row.outside_program_files {
+                            let text = egui::RichText::new(outside_mark()).weak();
+                            ui.add(egui::Label::new(text).truncate());
+                        }
                     });
                     cell(ui, PUBLISHER_W, h, false, |ui| {
                         ui.add(
@@ -1035,44 +1177,16 @@ fn list(ui: &mut egui::Ui, state: &mut AppsState) {
                             egui::Label::new(row.available.as_deref().unwrap_or("-")).truncate(),
                         );
                     });
-                    if let Some(cmd) = &row.official {
-                        if ui
-                            .add_enabled(!busy, egui::Button::new(l("Uninstall", "Uninstall")))
-                            .clicked()
-                        {
-                            chosen = Some(row.pending(Method::Uninstaller(cmd.clone())));
-                        }
-                    }
-                    if let Some(id) = &row.winget_id {
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(l(
-                                    "Uninstall with winget",
-                                    "Uninstall dengan winget",
-                                )),
-                            )
-                            .clicked()
-                        {
-                            chosen = Some(row.pending(Method::WingetUninstall(id.clone())));
-                        }
-                        if row.available.is_some()
-                            && ui
-                                .add_enabled(!busy, egui::Button::new(l("Update", "Perbarui")))
-                                .clicked()
-                        {
-                            chosen = Some(row.pending(Method::WingetUpgrade(id.clone())));
-                        }
-                    }
-                    if row.official.is_none() && row.winget_id.is_none() {
-                        ui.weak(l(
-                            "Cannot be uninstalled from here.",
-                            "Tidak bisa di-uninstall dari sini.",
-                        ));
-                    }
                 });
             }
         });
+    let offset = egui::vec2(scrolled.state.unclamped_offset().x, 0.0);
+    let mut head = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+        header_rect.min - offset,
+        egui::vec2(TABLE_W, h),
+    )));
+    head.set_clip_rect(header_rect.intersect(ui.clip_rect()));
+    header(&mut head, h);
     if let Some(p) = chosen {
         let phase = state.take_phase().ask(p);
         state.set_phase(phase);
@@ -1083,6 +1197,7 @@ fn list(ui: &mut egui::Ui, state: &mut AppsState) {
 mod tests {
     use super::*;
     use crate::confirm::ConfirmContext;
+    use crate::views::test_support::text_rect;
     use katharistis_core::apps::leftovers::Certainty;
     use katharistis_core::delete::DeleteMode;
     use std::cell::{Cell, RefCell};
@@ -1120,6 +1235,7 @@ mod tests {
         Pending {
             name: "Alpha".into(),
             entry,
+            winget_id: None,
             method,
         }
     }
@@ -1356,6 +1472,7 @@ mod tests {
                 AppRow::WingetOnly(pkg("Delta", "D.E", None)),
             ],
             &|_| true,
+            &program_files(),
         );
         assert_eq!(rows[0].winget_id.as_deref(), Some("A.B"));
         assert_eq!(rows[0].available.as_deref(), Some("2.0"));
@@ -1371,7 +1488,11 @@ mod tests {
     fn an_unquoted_path_must_be_an_existing_file_to_parse() {
         let mut e = app("k", "Alpha");
         e.uninstall = Some(r"C:\nowhere\u.exe /S".into());
-        let rows = build_rows(vec![AppRow::Registry(e, None)], &|_| false);
+        let rows = build_rows(
+            vec![AppRow::Registry(e, None)],
+            &|_| false,
+            &program_files(),
+        );
         assert!(rows[0].official.is_none());
     }
 
@@ -1386,6 +1507,209 @@ mod tests {
             entry: None,
             official: None,
             winget_id: None,
+            outside_program_files: false,
+        }
+    }
+
+    fn program_files() -> Vec<PathBuf> {
+        vec![r"C:\Program Files".into(), r"C:\Program Files (x86)".into()]
+    }
+
+    #[test]
+    fn only_a_location_outside_program_files_is_marked() {
+        let pf = program_files();
+        let outside = |p: &str| outside_program_files(Some(Path::new(p)), &pf);
+        assert!(outside(r"D:\Games\App"));
+        assert!(outside(r"C:\Users\me\AppData\Local\Programs\App"));
+        assert!(outside(r"C:\Program Files Extra\App"));
+        assert!(!outside(r"C:\Program Files\App"));
+        assert!(!outside(r"c:\program files (x86)\App\"));
+        assert!(!outside(r#""C:\Program Files\App""#));
+        // Nothing to go by, so nothing to say.
+        assert!(!outside_program_files(None, &pf));
+        assert!(!outside("not a place"));
+    }
+
+    #[test]
+    fn the_row_takes_its_mark_from_the_install_location() {
+        let located = |location: Option<&str>| AppEntry {
+            install_location: location.map(PathBuf::from),
+            ..app("k", "Alpha")
+        };
+        let rows = build_rows(
+            vec![
+                AppRow::Registry(located(Some(r"D:\Games\App")), None),
+                AppRow::Registry(located(Some(r"C:\Program Files\App")), None),
+                AppRow::Registry(located(None), None),
+                AppRow::WingetOnly(pkg("Delta", "D.E", None)),
+            ],
+            &|_| true,
+            &program_files(),
+        );
+        let marks: Vec<bool> = rows.iter().map(|r| r.outside_program_files).collect();
+        assert_eq!(marks, [true, false, false, false]);
+        // A mark, and the buttons stay.
+        assert!(rows[0].official.is_some());
+    }
+
+    fn with_id(method: Method, entry: Option<AppEntry>) -> Pending {
+        Pending {
+            winget_id: Some("A.B".into()),
+            ..pending(entry, method)
+        }
+    }
+
+    #[test]
+    fn a_winget_uninstall_that_worked_takes_the_package_out_of_the_next_merge() {
+        let mut packages = vec![pkg("Alpha", "A.B", None), pkg("Beta", "C.D", None)];
+        let p = with_id(Method::WingetUninstall("A.B".into()), None);
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(0)), false);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].id, "C.D");
+        let rows = build_rows(merge(Vec::new(), packages), &|_| true, &program_files());
+        assert!(rows.iter().all(|r| r.name != "Alpha"));
+    }
+
+    #[test]
+    fn a_failed_winget_uninstall_keeps_the_package_unless_the_key_is_gone() {
+        let start = || vec![pkg("Alpha", "A.B", None)];
+        let entry = Some(app("k", "Alpha"));
+        let p = with_id(Method::WingetUninstall("A.B".into()), entry.clone());
+        let mut packages = start();
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(3)), true);
+        assert_eq!(packages.len(), 1);
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(3)), false);
+        assert!(packages.is_empty());
+        // With no key to look at, a failure proves nothing.
+        let p = with_id(Method::WingetUninstall("A.B".into()), None);
+        let mut packages = start();
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(3)), false);
+        assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn the_official_uninstaller_drops_the_package_once_the_key_is_gone() {
+        let p = with_id(Method::Uninstaller(cmd()), Some(app("k", "Alpha")));
+        let mut packages = vec![pkg("Alpha", "A.B", None)];
+        packages_after_run(&mut packages, &p, &RunEnd::Done(None), true);
+        assert_eq!(packages.len(), 1);
+        packages_after_run(&mut packages, &p, &RunEnd::Done(None), false);
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_never_ran_changes_nothing() {
+        let p = with_id(Method::Uninstaller(cmd()), Some(app("k", "Alpha")));
+        let mut packages = vec![pkg("Alpha", "A.B", None)];
+        packages_after_run(&mut packages, &p, &RunEnd::Cancelled, false);
+        packages_after_run(&mut packages, &p, &RunEnd::Failed("x".into()), false);
+        assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn an_update_that_worked_stops_offering_the_update() {
+        let p = with_id(Method::WingetUpgrade("A.B".into()), Some(app("k", "Alpha")));
+        let mut packages = vec![pkg("Alpha", "A.B", Some("2.0"))];
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(7)), true);
+        assert_eq!(packages[0].available.as_deref(), Some("2.0"));
+        packages_after_run(&mut packages, &p, &RunEnd::Done(Some(0)), true);
+        assert_eq!(packages[0].available, None);
+        assert_eq!(packages[0].version, "2.0");
+    }
+
+    /// A list with every button a row can have, in a window `width` points wide.
+    fn drawn_list(width: f32, wheel: Option<egui::Vec2>) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut state = AppsState {
+            started: true,
+            rows: vec![Row {
+                official: Some(cmd()),
+                winget_id: Some("A.B".into()),
+                available: Some("2.0".into()),
+                outside_program_files: true,
+                ..row("Alpha", 5)
+            }],
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, state: &mut AppsState| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                events,
+                predicted_dt: 1.0,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| list(ui, state));
+            out.textures_delta.clear();
+            out
+        };
+        for _ in 0..3 {
+            frame(Vec::new(), &mut state);
+        }
+        if let Some(delta) = wheel {
+            frame(
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                        source: egui::MouseWheelSource::Unknown,
+                    },
+                ],
+                &mut state,
+            );
+        }
+        for _ in 0..5 {
+            frame(Vec::new(), &mut state);
+        }
+        frame(Vec::new(), &mut state)
+    }
+
+    #[test]
+    fn every_button_is_on_screen_in_the_default_window() {
+        let out = drawn_list(740.0, None);
+        for button in ["Uninstall", "via winget", "Update"] {
+            let at = text_rect(&out, button).unwrap_or_else(|| panic!("{button} is drawn"));
+            assert!(at.max.x <= ACTIONS_W, "{button} at {at:?}");
+        }
+    }
+
+    #[test]
+    fn the_buttons_fit_their_column_in_indonesian_too() {
+        let ctx = egui::Context::default();
+        let mut width = 0.0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let spacing = ui.spacing().clone();
+            let body = egui::TextStyle::Button.resolve(ui.style());
+            let labels = ["Uninstall", "lewat winget", "Perbarui"];
+            for text in labels {
+                let galley = ui
+                    .fonts_mut(|f| f.layout_no_wrap(text.into(), body.clone(), egui::Color32::RED));
+                width += galley.size().x + 2.0 * spacing.button_padding.x;
+            }
+            width += (labels.len() - 1) as f32 * spacing.item_spacing.x;
+        });
+        out.textures_delta.clear();
+        assert!(width <= ACTIONS_W, "{width}");
+    }
+
+    #[test]
+    fn the_header_stays_over_its_column_when_the_rows_scroll_sideways() {
+        for wheel in [None, Some(egui::vec2(-120.0, 0.0))] {
+            let out = drawn_list(740.0, wheel);
+            let head = text_rect(&out, "Name").expect("the header is drawn");
+            let cell = text_rect(&out, "Alpha").expect("the row is drawn");
+            assert!((head.min.x - cell.min.x).abs() < 0.5, "{head:?} {cell:?}");
+            let start = 250.0 + 8.0;
+            if wheel.is_some() {
+                assert!(cell.min.x < start, "it scrolled: {cell:?}");
+            } else {
+                assert!((cell.min.x - start).abs() < 0.5, "{cell:?}");
+            }
         }
     }
 

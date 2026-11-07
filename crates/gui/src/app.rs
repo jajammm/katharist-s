@@ -17,7 +17,7 @@ use crate::views::dupes::{self, DupesState};
 use crate::views::home::{self, HomeAction, HomeState};
 use crate::views::large::{self, LargeState};
 use crate::views::stale::{self, StaleState};
-use crate::{theme, views};
+use crate::{fonts, theme, views};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -64,6 +64,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_fonts(fonts::with_system_fallbacks());
         let settings_path = settings::default_path();
         let settings = settings::load_from(&settings_path);
         let protect = ProtectContext::from_env();

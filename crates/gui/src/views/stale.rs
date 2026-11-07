@@ -10,7 +10,7 @@ use katharistis_core::scan::{NodeId, ScanTree};
 
 use crate::i18n::l;
 use crate::views::filelist::{show_list, FileList};
-use crate::views::home::{HomeAction, HomeState};
+use crate::views::home::{area_of, Area, HomeAction, HomeState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Age {
@@ -46,6 +46,9 @@ impl Age {
 
 pub struct StaleState {
     age: Age,
+    /// Off at first: on a whole drive the oldest files are Windows' own and those of
+    /// installed programs, which have no checkbox and would bury everything else.
+    show_system: bool,
     list: FileList,
 }
 
@@ -53,14 +56,36 @@ impl Default for StaleState {
     fn default() -> Self {
         StaleState {
             age: Age::OneYear,
+            show_system: false,
             list: FileList::default(),
         }
     }
 }
 
-/// The rows for one age. `now` is read once per build.
-pub fn rows(tree: &ScanTree, age: Age, now: SystemTime) -> Vec<NodeId> {
-    stale_files(tree, age.duration(), now)
+/// The rows for one age. `now` is read once per build. Runs in the list's job, since
+/// telling the areas apart takes a path for every old file.
+pub fn rows(
+    tree: &ScanTree,
+    age: Age,
+    now: SystemTime,
+    show_system: bool,
+    protect: &ProtectContext,
+) -> Vec<NodeId> {
+    let mut ids = stale_files(tree, age.duration(), now);
+    if !show_system {
+        ids.retain(|&id| {
+            !matches!(
+                area_of(&tree.path_of(id), protect),
+                Area::Windows | Area::ProgramFiles
+            )
+        });
+    }
+    ids
+}
+
+/// What the rows depend on besides the tree.
+fn list_key(age: Age, show_system: bool) -> u64 {
+    age.key() * 2 + u64::from(show_system)
 }
 
 pub fn show(
@@ -82,8 +107,17 @@ pub fn show(
             ui.selectable_value(&mut st.age, age, age.label());
         }
     });
+    ui.checkbox(
+        &mut st.show_system,
+        l(
+            "Show files in Windows and Program Files",
+            "Tampilkan file di Windows dan Program Files",
+        ),
+    );
     ui.add_space(6.0);
     let age = st.age;
+    let show_system = st.show_system;
+    let area_context = protect.clone();
     show_list(
         ui,
         "stale-list",
@@ -91,14 +125,14 @@ pub fn show(
         home,
         protect,
         &mut st.list,
-        age.key(),
+        list_key(age, show_system),
         l(
             "No file has gone unchanged that long.",
             "Tidak ada file yang selama itu tidak diubah.",
         ),
         {
             let now = SystemTime::now();
-            move |tree| rows(tree, age, now)
+            move |tree| rows(tree, age, now, show_system, &area_context)
         },
     )
 }
@@ -107,10 +141,60 @@ pub fn show(
 mod tests {
     use super::*;
     use crate::views::test_support::{file, tree_of};
+    use std::path::PathBuf;
+
+    fn ctx() -> ProtectContext {
+        ProtectContext {
+            windows_dir: r"C:\Windows".into(),
+            program_files: vec![r"C:\Program Files".into(), r"C:\Program Files (x86)".into()],
+            program_data: r"C:\ProgramData".into(),
+            users_dir: r"C:\Users".into(),
+            profile: r"C:\Users\me".into(),
+            own_dirs: vec![r"C:\Users\me\own".into()],
+        }
+    }
+
+    #[test]
+    fn windows_and_program_files_stay_out_until_asked_for() {
+        let now = SystemTime::now();
+        let old = |name: &str| {
+            let mut f = file(name, 1);
+            f.modified = Some(now - Duration::from_secs(1000 * 86_400));
+            f
+        };
+        let mut tree = tree_of(vec![
+            old(r"Windows\System32\old.dll"),
+            old(r"Program Files\App\old.exe"),
+            old(r"Program Files (x86)\App\old.exe"),
+            old(r"Users\me\old.zip"),
+            old(r"Games\old.iso"),
+        ]);
+        tree.root_path = PathBuf::from(r"C:\");
+        let names = |show| -> Vec<String> {
+            rows(&tree, Age::OneYear, now, show, &ctx())
+                .into_iter()
+                .map(|id| tree.nodes[id].name.clone())
+                .collect()
+        };
+        assert_eq!(names(false), [r"Games\old.iso", r"Users\me\old.zip"]);
+        assert_eq!(names(true).len(), 5);
+    }
+
+    #[test]
+    fn the_toggle_and_the_age_each_make_the_list_again() {
+        let mut keys: Vec<u64> = Age::ALL
+            .iter()
+            .flat_map(|&a| [list_key(a, false), list_key(a, true)])
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 6);
+    }
 
     #[test]
     fn the_default_is_one_year_and_the_choices_are_the_three_asked_for() {
         assert_eq!(StaleState::default().age, Age::OneYear);
+        assert!(!StaleState::default().show_system);
         let days: Vec<u64> = Age::ALL
             .iter()
             .map(|a| a.duration().as_secs() / 86_400)
@@ -133,7 +217,7 @@ mod tests {
         let unknown = file("unknown.txt", 1);
         let tree = tree_of(vec![a, b, c, d, unknown]);
         let names = |age| -> Vec<String> {
-            rows(&tree, age, now)
+            rows(&tree, age, now, true, &ctx())
                 .into_iter()
                 .map(|id| tree.nodes[id].name.clone())
                 .collect()

@@ -43,3 +43,13 @@ pub fn tree_of(files: Vec<Node>) -> ScanTree {
         cancelled: false,
     }
 }
+
+/// Where the text that is exactly `text` was drawn, if it was.
+pub fn text_rect(out: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+    out.shapes.iter().find_map(|clipped| match &clipped.shape {
+        egui::Shape::Text(shape) if shape.galley.text() == text => {
+            Some(egui::Rect::from_min_size(shape.pos, shape.galley.size()))
+        }
+        _ => None,
+    })
+}
