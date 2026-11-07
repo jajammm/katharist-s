@@ -14,7 +14,7 @@ use katharistis_core::apps::registry::list_installed;
 use katharistis_core::delete::{DeleteMode, DeleteReport, Target};
 use katharistis_core::format::format_size;
 use katharistis_core::other_space::{other_space, OtherSpace, SystemItem};
-use katharistis_core::protect::{is_protected, ProtectContext};
+use katharistis_core::protect::{canonical_key, is_protected, ProtectContext};
 use katharistis_core::recycle::is_guard_name;
 use katharistis_core::scan::{
     scan, EntryClass, Node, NodeId, ScanError, ScanOptions, ScanProgress, ScanTree,
@@ -134,12 +134,43 @@ pub fn format_date(modified: Option<SystemTime>) -> String {
 }
 
 fn lower_at_or_under(path_lower: &str, base: &Path) -> bool {
-    let base = base.to_string_lossy().to_lowercase();
-    let base = base.trim_end_matches('\\');
+    key_at_or_under(path_lower, &base.to_string_lossy().to_lowercase())
+}
+
+/// Both already lowercase.
+fn key_at_or_under(path_lower: &str, base_lower: &str) -> bool {
+    let base = base_lower.trim_end_matches('\\');
     !base.is_empty()
         && path_lower
             .strip_prefix(base)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+}
+
+/// How many `(path, is a folder)` targets may take more with them than the tree
+/// counted: an excluded folder or an unreadable path is at or inside it, or the scan
+/// was cancelled before it finished a folder. A file's own size was read whole, so a
+/// cancelled scan says nothing about a file. `excluded` is lowercase keys.
+pub fn count_holding_more(
+    targets: &[(PathBuf, bool)],
+    excluded: &[String],
+    errors: &[ScanError],
+    cancelled: bool,
+) -> usize {
+    let errors: Vec<String> = errors
+        .iter()
+        .map(|e| e.path.to_string_lossy().to_lowercase())
+        .collect();
+    targets
+        .iter()
+        .filter(|(path, is_folder)| {
+            let target = path.to_string_lossy().to_lowercase();
+            (*is_folder && cancelled)
+                || excluded
+                    .iter()
+                    .chain(&errors)
+                    .any(|missing| key_at_or_under(missing, &target))
+        })
+        .count()
 }
 
 /// The kind of place a path is in, for the map's colours. Says nothing about risk.
@@ -288,6 +319,7 @@ pub fn request_from_selection(
     tree: &ScanTree,
     selection: &BTreeSet<NodeId>,
     flags: &HashMap<NodeId, RowFlags>,
+    excluded: &[String],
     mode: DeleteMode,
 ) -> ConfirmRequest {
     let picked: Vec<NodeId> = selection
@@ -295,11 +327,16 @@ pub fn request_from_selection(
         .copied()
         .filter(|id| can_select(flags.get(id)))
         .collect();
+    let targets: Vec<(PathBuf, bool)> = picked
+        .iter()
+        .map(|&id| (tree.path_of(id), tree.nodes[id].class == EntryClass::Dir))
+        .collect();
     ConfirmRequest {
         warn_app_owned: picked
             .iter()
             .filter(|id| flags.get(id).is_some_and(|f| f.app_owned))
             .count(),
+        warn_holds_more: count_holding_more(&targets, excluded, &tree.errors, tree.cancelled),
         items: picked
             .iter()
             .map(|&id| Target {
@@ -310,6 +347,7 @@ pub fn request_from_selection(
         mode,
         context: ConfirmContext::User,
         empty_bin: None,
+        bin_load: None,
         guards: Vec::new(),
     }
 }
@@ -557,6 +595,8 @@ pub struct HomeState {
     location: NodeId,
     view: Option<LocationView>,
     selection: BTreeSet<NodeId>,
+    /// The folders the current tree was scanned without, as lowercase keys.
+    scan_excluded: Vec<String>,
     pane: Pane,
     other: OtherLoad,
     map_stale: bool,
@@ -598,6 +638,7 @@ impl HomeState {
             location: 0,
             view: None,
             selection: BTreeSet::new(),
+            scan_excluded: Vec::new(),
             pane: Pane::Map,
             other: OtherLoad::Idle,
             map_stale: false,
@@ -644,6 +685,10 @@ impl HomeState {
         self.locks = Locks::default();
         self.space_root = root.clone();
         self.refresh_space(ctx);
+        self.scan_excluded = excluded
+            .iter()
+            .map(|p| canonical_key(p).unwrap_or_else(|| p.to_string_lossy().to_lowercase()))
+            .collect();
         let progress = ScanProgress::default();
         let seen = progress.clone();
         let job = Job::spawn(ctx.clone(), move || {
@@ -671,6 +716,10 @@ impl HomeState {
 
     pub fn locks(&self) -> &Locks {
         &self.locks
+    }
+
+    pub(crate) fn scan_excluded(&self) -> &[String] {
+        &self.scan_excluded
     }
 
     /// `None` until the installed-app list is in; rows get no checkbox before then.
@@ -1190,13 +1239,14 @@ pub(crate) fn can_delete(selection: &BTreeSet<NodeId>, marks_ready: bool, map_st
 pub(crate) fn delete_action(
     tree: &ScanTree,
     flags: &HashMap<NodeId, RowFlags>,
+    excluded: &[String],
     selection: &BTreeSet<NodeId>,
     pressed: Option<DeleteMode>,
     allowed: bool,
 ) -> Option<HomeAction> {
     pressed
         .filter(|_| allowed)
-        .map(|mode| request_from_selection(tree, selection, flags, mode))
+        .map(|mode| request_from_selection(tree, selection, flags, excluded, mode))
         .filter(|request| !request.items.is_empty())
         .map(HomeAction::Delete)
 }
@@ -1212,6 +1262,7 @@ pub(crate) fn action_bar(
     ui: &mut egui::Ui,
     tree: &ScanTree,
     flags: &HashMap<NodeId, RowFlags>,
+    excluded: &[String],
     selection: &BTreeSet<NodeId>,
     marks_ready: bool,
     map_stale: bool,
@@ -1245,7 +1296,7 @@ pub(crate) fn action_bar(
             format_size(total)
         ));
     });
-    delete_action(tree, flags, selection, mode, can_delete)
+    delete_action(tree, flags, excluded, selection, mode, can_delete)
 }
 
 /// Everything below the controls, once there is a tree.
@@ -1379,6 +1430,7 @@ fn body(
                 ui,
                 tree,
                 &view.flags,
+                &st.scan_excluded,
                 &st.selection,
                 marks.is_some(),
                 st.map_stale,
@@ -1550,6 +1602,81 @@ mod tests {
     }
 
     const DAY: Duration = Duration::from_secs(86_400);
+
+    #[test]
+    fn a_target_holding_what_the_scan_left_out_is_counted() {
+        let folder = |p: &str| (PathBuf::from(p), true);
+        let error = |p: &str| ScanError {
+            path: PathBuf::from(p),
+            reason: "denied".into(),
+        };
+        let excluded = [r"c:\t\a\keep".to_string()];
+        let errors = [error(r"C:\T\B\Locked")];
+
+        // Holds the excluded folder, in any case of spelling.
+        assert_eq!(
+            count_holding_more(&[folder(r"C:\T\A")], &excluded, &[], false),
+            1
+        );
+        // Holds an unreadable folder, or is one.
+        assert_eq!(
+            count_holding_more(&[folder(r"C:\t\b")], &[], &errors, false),
+            1
+        );
+        assert_eq!(
+            count_holding_more(&[folder(r"C:\t\b\locked")], &[], &errors, false),
+            1
+        );
+        // Beside them, or only inside them, a target holds nothing it does not show.
+        for clean in [r"C:\t\c", r"C:\t\a\keeper", r"C:\t\b\locked\inner"] {
+            assert_eq!(
+                count_holding_more(&[folder(clean)], &excluded, &errors, false),
+                0,
+                "{clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_counts_folders_and_not_files() {
+        let targets = [
+            (PathBuf::from(r"C:\t\dir"), true),
+            (PathBuf::from(r"C:\t\file"), false),
+        ];
+        assert_eq!(count_holding_more(&targets, &[], &[], true), 1);
+        assert_eq!(count_holding_more(&targets, &[], &[], false), 0);
+    }
+
+    #[test]
+    fn the_request_carries_the_count() {
+        let mut t = tree_at(r"C:\t");
+        let flags: HashMap<NodeId, RowFlags> = [(
+            1,
+            RowFlags {
+                protected: false,
+                app_owned: false,
+                guard: false,
+                locked: false,
+            },
+        )]
+        .into();
+        let sel = BTreeSet::from([1]);
+        let quiet = request_from_selection(&t, &sel, &flags, &[], DeleteMode::RecycleBin);
+        assert_eq!(quiet.warn_holds_more, 0);
+        let excluded = [r"c:\t\a\skipped".to_string()];
+        let req = request_from_selection(&t, &sel, &flags, &excluded, DeleteMode::RecycleBin);
+        assert_eq!(req.warn_holds_more, 1);
+        t.cancelled = true;
+        let req = request_from_selection(&t, &sel, &flags, &[], DeleteMode::RecycleBin);
+        assert_eq!(req.warn_holds_more, 1);
+        t.cancelled = false;
+        t.errors.push(ScanError {
+            path: PathBuf::from(r"C:\t\a\denied"),
+            reason: "denied".into(),
+        });
+        let req = request_from_selection(&t, &sel, &flags, &[], DeleteMode::RecycleBin);
+        assert_eq!(req.warn_holds_more, 1);
+    }
 
     #[test]
     fn folder_text_is_refused_unless_absolute() {
@@ -1776,7 +1903,7 @@ mod tests {
         let flags = HashMap::from([(1, owned), (4, plain), (3, shielded)]);
         // 2 has no flags yet, 3 is protected: neither may reach the request.
         let sel = BTreeSet::from([1, 2, 3, 4]);
-        let req = request_from_selection(&t, &sel, &flags, DeleteMode::RecycleBin);
+        let req = request_from_selection(&t, &sel, &flags, &[], DeleteMode::RecycleBin);
         assert_eq!(req.mode, DeleteMode::RecycleBin);
         assert_eq!(req.context, ConfirmContext::User);
         assert_eq!(req.warn_app_owned, 1);
@@ -1793,8 +1920,13 @@ mod tests {
     #[test]
     fn nothing_is_selected_on_arrival_and_permanent_needs_asking_for() {
         let t = tree_at(r"C:\t");
-        let req =
-            request_from_selection(&t, &BTreeSet::new(), &HashMap::new(), DeleteMode::Permanent);
+        let req = request_from_selection(
+            &t,
+            &BTreeSet::new(),
+            &HashMap::new(),
+            &[],
+            DeleteMode::Permanent,
+        );
         assert!(req.items.is_empty());
         assert_eq!(req.mode, DeleteMode::Permanent);
     }
@@ -2036,13 +2168,13 @@ mod tests {
         assert!(!can_delete(&BTreeSet::new(), true, false));
         for mode in [DeleteMode::RecycleBin, DeleteMode::Permanent] {
             let allowed = can_delete(&sel, true, true);
-            assert!(delete_action(&t, &flags, &sel, Some(mode), allowed).is_none());
+            assert!(delete_action(&t, &flags, &[], &sel, Some(mode), allowed).is_none());
             let allowed = can_delete(&sel, true, false);
             assert!(matches!(
-                delete_action(&t, &flags, &sel, Some(mode), allowed),
+                delete_action(&t, &flags, &[], &sel, Some(mode), allowed),
                 Some(HomeAction::Delete(_))
             ));
-            assert!(delete_action(&t, &flags, &sel, None, allowed).is_none());
+            assert!(delete_action(&t, &flags, &[], &sel, None, allowed).is_none());
         }
     }
 
@@ -2088,13 +2220,13 @@ mod tests {
             assert!(!can_select(flags.get(&id)));
             for mode in [DeleteMode::RecycleBin, DeleteMode::Permanent] {
                 let sel = BTreeSet::from([id]);
-                assert!(delete_action(&t, &flags, &sel, Some(mode), true).is_none());
+                assert!(delete_action(&t, &flags, &[], &sel, Some(mode), true).is_none());
             }
         }
         // So nothing can add to the 100 already claimed from this folder.
         let everything = BTreeSet::from([1, 2, 3]);
         let flags: HashMap<_, _> = [1, 2, 3].map(|id| (id, row(&st.locks, &t, id))).into();
-        let req = request_from_selection(&t, &everything, &flags, DeleteMode::Permanent);
+        let req = request_from_selection(&t, &everything, &flags, &[], DeleteMode::Permanent);
         assert_eq!(req.items.iter().map(|i| i.size).sum::<u64>(), 0);
     }
 
@@ -2140,7 +2272,7 @@ mod tests {
         let sel = BTreeSet::from([3]);
         let allowed = can_delete(&sel, true, st.map_stale);
         let Some(HomeAction::Delete(req)) =
-            delete_action(&t, &flags, &sel, Some(DeleteMode::RecycleBin), allowed)
+            delete_action(&t, &flags, &[], &sel, Some(DeleteMode::RecycleBin), allowed)
         else {
             panic!("expected a delete for the sibling");
         };
@@ -2150,7 +2282,15 @@ mod tests {
         // Ticking the locked path yields nothing.
         let locked = BTreeSet::from([2]);
         let allowed = can_delete(&locked, true, st.map_stale);
-        assert!(delete_action(&t, &flags, &locked, Some(DeleteMode::Permanent), allowed).is_none());
+        assert!(delete_action(
+            &t,
+            &flags,
+            &[],
+            &locked,
+            Some(DeleteMode::Permanent),
+            allowed
+        )
+        .is_none());
     }
 
     #[test]
@@ -2252,7 +2392,8 @@ mod tests {
         // Not through a stale selection either.
         let t = tree_at(r"C:\t");
         let by_id = HashMap::from([(4, flags)]);
-        let req = request_from_selection(&t, &BTreeSet::from([4]), &by_id, DeleteMode::Permanent);
+        let req =
+            request_from_selection(&t, &BTreeSet::from([4]), &by_id, &[], DeleteMode::Permanent);
         assert!(req.items.is_empty());
     }
 
@@ -2279,7 +2420,13 @@ mod tests {
 
         let t = tree_at(r"C:\t");
         let by_id = HashMap::from([(1, holding)]);
-        let req = request_from_selection(&t, &BTreeSet::from([1]), &by_id, DeleteMode::RecycleBin);
+        let req = request_from_selection(
+            &t,
+            &BTreeSet::from([1]),
+            &by_id,
+            &[],
+            DeleteMode::RecycleBin,
+        );
         assert_eq!(req.warn_app_owned, 1);
         let hover = hover_lines("n", 1, None, false, holding.app_owned).join("\n");
         assert!(hover.contains("used by an app"));

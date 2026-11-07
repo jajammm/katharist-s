@@ -383,8 +383,10 @@ pub fn request_from(items: &[Leftover], ticked: &[PathBuf]) -> Option<ConfirmReq
         items: targets,
         mode: DeleteMode::RecycleBin,
         warn_app_owned: 0,
+        warn_holds_more: 0,
         context: ConfirmContext::Leftovers,
         empty_bin: None,
+        bin_load: None,
         guards: Vec::new(),
     })
 }

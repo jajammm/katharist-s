@@ -104,18 +104,25 @@ impl App {
         match action {
             HomeAction::Scan(root) => {
                 let excluded = self.excluded();
-                self.home.start_scan(ctx, root, excluded, &mut self.tree);
+                begin_scan(
+                    ctx,
+                    &mut self.home,
+                    &mut self.dupes,
+                    root,
+                    excluded,
+                    &mut self.tree,
+                );
             }
-            HomeAction::Delete(request) => self.start_flow(request),
+            HomeAction::Delete(request) => self.start_flow(ctx, request),
         }
     }
 
     /// Opens the confirmation. Only one flow runs at a time.
-    fn start_flow(&mut self, mut request: ConfirmRequest) {
+    fn start_flow(&mut self, ctx: &egui::Context, mut request: ConfirmRequest) {
         if self.flow.is_idle() {
             self.flow_context = request.context;
             self.flow_guards = std::mem::take(&mut request.guards);
-            self.flow = DeleteFlow::Confirm(request);
+            self.flow = confirm::open_request(ctx, request);
         }
     }
 
@@ -147,6 +154,7 @@ impl App {
                 let excluded = self.excluded();
                 self.clean.start_scan(ctx, &excluded);
             }
+            self.clean.refresh_bin(ctx);
         }
         self.guard_close(ctx);
     }
@@ -273,6 +281,20 @@ impl App {
     }
 }
 
+/// A new scan makes the old tree worthless, so a search still hashing on it stops now.
+/// The Duplicates screen would only notice when it is opened again.
+fn begin_scan(
+    ctx: &egui::Context,
+    home: &mut HomeState,
+    dupes: &mut DupesState,
+    root: PathBuf,
+    excluded: Vec<PathBuf>,
+    tree: &mut Option<Arc<ScanTree>>,
+) {
+    dupes.cancel_search();
+    home.start_scan(ctx, root, excluded, tree);
+}
+
 fn system_drive() -> Option<(String, u64, u64)> {
     let name = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let root = format!("{name}\\");
@@ -328,13 +350,13 @@ impl eframe::App for App {
                         let busy = !self.flow.is_idle();
                         let excluded = self.excluded();
                         if let Some(request) = clean::show(ui, &mut self.clean, busy, &excluded) {
-                            self.start_flow(request);
+                            self.start_flow(&ctx, request);
                         }
                     }
                     Tool::Apps => {
                         let busy = !self.flow.is_idle();
                         if let Some(request) = apps::show(ui, &mut self.apps, busy) {
-                            self.start_flow(request);
+                            self.start_flow(&ctx, request);
                         }
                     }
                     Tool::Large => {
@@ -388,5 +410,31 @@ impl eframe::App for App {
             self.apply_language();
             self.apply_theme(ui.ctx());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use katharistis_core::scan::ScanProgress;
+
+    #[test]
+    fn a_new_scan_stops_a_search_on_the_old_tree() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let protect = ProtectContext::from_env();
+        let mut home = HomeState::new(&ctx, &protect);
+        let progress = ScanProgress::default();
+        let mut dupes = DupesState::searching(&ctx, progress.clone());
+        let mut tree = None;
+        begin_scan(
+            &ctx,
+            &mut home,
+            &mut dupes,
+            dir.path().to_path_buf(),
+            Vec::new(),
+            &mut tree,
+        );
+        assert!(progress.is_cancelled());
     }
 }

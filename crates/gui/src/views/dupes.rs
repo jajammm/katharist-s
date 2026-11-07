@@ -97,11 +97,13 @@ impl DupeSelection {
         self.picked.iter().map(BTreeSet::len).sum()
     }
 
-    pub fn picked_bytes(&self) -> u64 {
+    /// What the ticked files take on disk, by `size_of` where it knows a file and by
+    /// the logical length where it does not.
+    pub fn picked_bytes(&self, size_of: &dyn Fn(&Path) -> Option<u64>) -> u64 {
         self.groups
             .iter()
             .zip(&self.picked)
-            .map(|(g, p)| g.size * p.len() as u64)
+            .flat_map(|(g, picked)| picked.iter().map(|p| size_of(p).unwrap_or(g.size)))
             .sum()
     }
 
@@ -202,12 +204,16 @@ pub fn snapshot(sel: &DupeSelection) -> Vec<(DuplicateGroup, Vec<PathBuf>)> {
 }
 
 /// Takes the failed groups out of the selection, and builds the confirmation from
-/// the rest. Whatever cannot have a checkbox stays out, whatever was ticked.
+/// the rest. Whatever cannot have a checkbox stays out, whatever was ticked. Sizes are
+/// what the files take on disk, from `size_of`, as on every other screen: the group's
+/// logical length would overstate a compressed copy. A file `size_of` does not know
+/// falls back to that length.
 pub fn apply_check(
     sel: &mut DupeSelection,
     checked: &Checked,
     flags: &HashMap<PathBuf, RowFlags>,
     mode: DeleteMode,
+    size_of: &dyn Fn(&Path) -> Option<u64>,
 ) -> Option<ConfirmRequest> {
     for failed in &checked.failed {
         if let Some(i) = sel.groups().iter().position(|g| g.keep == failed.keep) {
@@ -225,7 +231,7 @@ pub fn apply_check(
             warn_app_owned += usize::from(f.is_some_and(|f| f.app_owned));
             items.push(Target {
                 path: path.clone(),
-                size: group.size,
+                size: size_of(path).unwrap_or(group.size),
             });
         }
     }
@@ -233,8 +239,10 @@ pub fn apply_check(
         items,
         mode,
         warn_app_owned,
+        warn_holds_more: 0,
         context: ConfirmContext::Duplicates,
         empty_bin: None,
+        bin_load: None,
         guards: checked.ok.clone(),
     })
 }
@@ -287,7 +295,21 @@ impl DupesState {
         }
     }
 
-    /// Stops a search that holds the tree, so a delete can change the tree.
+    /// A search under way that only `progress` can stop.
+    #[cfg(test)]
+    pub fn searching(ctx: &egui::Context, progress: ScanProgress) -> Self {
+        DupesState {
+            phase: Some(Phase::Finding {
+                job: Job::spawn(ctx.clone(), Vec::new),
+                progress,
+                generation: 0,
+            }),
+            ..DupesState::default()
+        }
+    }
+
+    /// Stops a search that holds the tree, so a delete can change the tree or a new
+    /// scan can let go of it.
     pub fn cancel_search(&mut self) {
         if let Some(Phase::Finding { progress, .. }) = &self.phase {
             progress.cancel();
@@ -340,7 +362,7 @@ impl DupesState {
 
     /// Takes in a finished job. `generation` is the tree's now. May return the
     /// confirmation to open.
-    fn poll(&mut self, generation: u64) -> Option<ConfirmRequest> {
+    fn poll(&mut self, generation: u64, tree: &ScanTree) -> Option<ConfirmRequest> {
         match self.phase.take() {
             Some(Phase::Finding {
                 mut job,
@@ -419,7 +441,9 @@ impl DupesState {
                             .then(|| removed_notice(checked.failed.len()));
                         self.rows_rev = None;
                         let sel = self.sel.as_mut()?;
-                        apply_check(sel, &checked, &flags, mode)
+                        apply_check(sel, &checked, &flags, mode, &|p| {
+                            find_node(tree, p).map(|id| tree.nodes[id].size)
+                        })
                     }
                     Err(JobPanicked) => {
                         self.notice = Some(
@@ -480,7 +504,7 @@ pub fn show(
         return without_tree(ui, home);
     };
     st.sync(home);
-    let mut action = st.poll(home.generation()).map(HomeAction::Delete);
+    let mut action = st.poll(home.generation(), tree).map(HomeAction::Delete);
     if home.map_stale() {
         action = action.or(stale_notice(ui, tree));
     }
@@ -665,16 +689,25 @@ fn list(
             }
         });
     ui.add_space(4.0);
-    bar(ui, st, home, flow_busy)
+    bar(ui, st, tree, home, flow_busy)
 }
 
 fn bar(
     ui: &mut egui::Ui,
     st: &mut DupesState,
+    tree: &ScanTree,
     home: &HomeState,
     flow_busy: bool,
 ) -> Option<HomeAction> {
     let idle = st.idle();
+    let flags = &st.flags;
+    // Every ticked row has its flags, and with them its node: no walk per frame.
+    let size_of = |p: &Path| {
+        flags
+            .get(p)
+            .and_then(|info| info.1)
+            .map(|id| tree.nodes[id].size)
+    };
     let sel = st.sel.as_ref()?;
     let can =
         sel.picked_count() > 0 && home.marks().is_some() && !home.map_stale() && !flow_busy && idle;
@@ -702,7 +735,7 @@ fn bar(
             "{} {}, {}",
             sel.picked_count(),
             l("selected", "dipilih"),
-            format_size(sel.picked_bytes())
+            format_size(sel.picked_bytes(&size_of))
         ));
     });
     let mode = mode?;
@@ -839,7 +872,10 @@ mod tests {
             (PathBuf::from(r"C:\b\y1"), ok_flags()),
         ]
         .into();
-        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::RecycleBin).unwrap();
+        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::RecycleBin, &|_| {
+            None
+        })
+        .unwrap();
         assert_eq!(sel.groups().len(), 1);
         assert_eq!(sel.groups()[0].keep, PathBuf::from(r"C:\b\k2"));
         assert_eq!(request.items.len(), 1);
@@ -854,7 +890,13 @@ mod tests {
         let mut sel = two_groups();
         sel.toggle(0, Path::new(r"C:\a\x1"));
         let checked = check_groups(snapshot(&sel), |_, _| false);
-        let request = apply_check(&mut sel, &checked, &HashMap::new(), DeleteMode::Permanent);
+        let request = apply_check(
+            &mut sel,
+            &checked,
+            &HashMap::new(),
+            DeleteMode::Permanent,
+            &|_| None,
+        );
         assert!(request.is_none());
         assert_eq!(sel.groups().len(), 1);
     }
@@ -872,11 +914,40 @@ mod tests {
             (PathBuf::from(r"C:\a\x2"), ok_flags()),
         ]
         .into();
-        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::RecycleBin).unwrap();
+        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::RecycleBin, &|_| {
+            None
+        })
+        .unwrap();
         assert_eq!(request.items.len(), 1);
         assert_eq!(request.items[0].path, PathBuf::from(r"C:\a\x2"));
-        let none = apply_check(&mut sel, &checked, &HashMap::new(), DeleteMode::RecycleBin);
+        let none = apply_check(
+            &mut sel,
+            &checked,
+            &HashMap::new(),
+            DeleteMode::RecycleBin,
+            &|_| None,
+        );
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn sizes_are_what_the_files_take_on_disk_where_the_tree_knows_them() {
+        let mut sel = two_groups();
+        sel.toggle(0, Path::new(r"C:\a\x1"));
+        sel.toggle(0, Path::new(r"C:\a\x2"));
+        let on_disk = |p: &Path| (p == Path::new(r"C:\a\x1")).then_some(4);
+        // The first is known, compressed to 4. The second falls back to its length.
+        assert_eq!(sel.picked_bytes(&on_disk), 14);
+        let checked = check_groups(snapshot(&sel), |_, _| true);
+        let flags: HashMap<PathBuf, RowFlags> = [
+            (PathBuf::from(r"C:\a\x1"), ok_flags()),
+            (PathBuf::from(r"C:\a\x2"), ok_flags()),
+        ]
+        .into();
+        let request =
+            apply_check(&mut sel, &checked, &flags, DeleteMode::Permanent, &on_disk).unwrap();
+        let sizes: Vec<u64> = request.items.iter().map(|i| i.size).collect();
+        assert_eq!(sizes, [4, 10]);
     }
 
     #[test]
@@ -960,7 +1031,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         st.leave();
         assert!(st.phase.is_none());
-        assert!(st.poll(0).is_none(), "nothing may start after leaving");
+        assert!(
+            st.poll(0, &crate::views::test_support::tree_of(Vec::new()))
+                .is_none(),
+            "nothing may start after leaving"
+        );
         assert_eq!(st.sel.as_ref().unwrap().picked_count(), 1);
     }
 
@@ -987,7 +1062,8 @@ mod tests {
         sel.toggle(0, Path::new(r"C:\a\x1"));
         let checked = check_groups(snapshot(&sel), |_, _| true);
         let flags: HashMap<PathBuf, RowFlags> = [(PathBuf::from(r"C:\a\x1"), ok_flags())].into();
-        let request = apply_check(&mut sel, &checked, &flags, DeleteMode::Permanent).unwrap();
+        let request =
+            apply_check(&mut sel, &checked, &flags, DeleteMode::Permanent, &|_| None).unwrap();
         assert_eq!(request.guards.len(), 1);
         assert_eq!(request.guards[0].0.keep, PathBuf::from(r"C:\a\k1"));
         assert_eq!(request.guards[0].1, vec![PathBuf::from(r"C:\a\x1")]);
@@ -999,6 +1075,13 @@ mod tests {
         let mut sel = two_groups();
         sel.toggle(0, Path::new(r"C:\a\x1"));
         let checked = check_groups(snapshot(&sel), |_, _| true);
-        assert!(apply_check(&mut sel, &checked, &HashMap::new(), DeleteMode::Permanent).is_none());
+        assert!(apply_check(
+            &mut sel,
+            &checked,
+            &HashMap::new(),
+            DeleteMode::Permanent,
+            &|_| None
+        )
+        .is_none());
     }
 }

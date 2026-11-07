@@ -19,10 +19,16 @@ pub struct ConfirmRequest {
     pub items: Vec<Target>,
     pub mode: DeleteMode,
     pub warn_app_owned: usize,
+    /// How many items may take more with them than their size says: see
+    /// `views::home::count_holding_more`.
+    pub warn_holds_more: usize,
     pub context: ConfirmContext,
     /// `Some(size)` when the same confirmation also empties the Recycle Bin, which
     /// held `size` bytes when it was read. Raised only by the cleanup screen.
     pub empty_bin: Option<u64>,
+    /// The second reading of the bin, from `open_request`. The first may be from long
+    /// before this dialog; the size shown and the button wait for this one.
+    pub bin_load: Option<BinLoad>,
     /// Duplicate groups with the files of each that this request deletes. The delete
     /// checks each group again in its own job, right before it deletes, and leaves
     /// alone every file of a group whose copy to keep changed. Empty for any other
@@ -99,7 +105,26 @@ pub struct ConfirmSummary {
     pub permanent: bool,
     pub says_not_in_bin: bool,
     pub app_owned: usize,
+    pub holds_more: usize,
     pub empty_bin: Option<u64>,
+    /// The bin is being read again, so its size is not to be trusted yet.
+    pub bin_reading: bool,
+    /// Reading it again failed, so its size is unknown.
+    pub bin_unread: bool,
+}
+
+impl ConfirmSummary {
+    /// Nothing to delete: the only thing this confirms is emptying the bin.
+    fn bin_only(&self) -> bool {
+        self.count == 0 && self.empty_bin.is_some()
+    }
+
+    /// Whether the confirm button means anything yet. A bin read as empty has nothing
+    /// to empty; one that could not be read is still the user's to try.
+    fn can_confirm(&self) -> bool {
+        !self.bin_reading
+            && (self.count > 0 || self.empty_bin.is_some_and(|b| b > 0 || self.bin_unread))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +143,10 @@ pub fn confirm_summary(req: &ConfirmRequest) -> ConfirmSummary {
         permanent,
         says_not_in_bin: permanent,
         app_owned: req.warn_app_owned,
+        holds_more: req.warn_holds_more,
         empty_bin: req.empty_bin,
+        bin_reading: matches!(req.bin_load, Some(BinLoad::Loading(_))),
+        bin_unread: matches!(req.bin_load, Some(BinLoad::Known(None))),
     }
 }
 
@@ -225,9 +253,9 @@ fn split_unknown(mut first: DeleteReport, sent: Vec<Target>) -> (DeleteReport, V
     (first, sent)
 }
 
-/// What is known after asking Windows to empty the bin. The system asks the user
-/// too, and a "no" there does not reliably come back as an error, so whether the
-/// bin was emptied is read from the bin afterwards.
+/// What is known after asking Windows to empty the bin. An emptying that did not
+/// finish does not reliably come back as an error, so what happened is read from the
+/// bin afterwards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BinEmptied {
     pub before: Option<(u64, u64)>,
@@ -239,6 +267,50 @@ impl BinEmptied {
     fn is_empty_now(&self) -> bool {
         self.after == Some((0, 0))
     }
+}
+
+/// What emptying gave back, as read from the bin before and after. `None` when either
+/// reading failed. Something recycled meanwhile can make the bin grow, which is no
+/// space lost by emptying, so it stops at 0.
+pub fn bin_released(b: &BinEmptied) -> Option<u64> {
+    Some(b.before?.0.saturating_sub(b.after?.0))
+}
+
+/// The bold line of a report.
+fn space_gained_text(bytes: u64) -> String {
+    format!(
+        "{} {}",
+        l("Space gained:", "Ruang yang didapat:"),
+        format_size(bytes)
+    )
+}
+
+/// The bold line once the bin has been asked to empty: what the delete freed and what
+/// the bin gave back. Items sent to the bin earlier are in that second number only.
+pub fn emptied_gain_text(r: &DeleteReport, b: &BinEmptied) -> String {
+    let released = bin_released(b);
+    let mut text = space_gained_text(r.bytes_freed.saturating_add(released.unwrap_or(0)));
+    if released.is_none() {
+        text.push_str(l(
+            " (without the Recycle Bin, which could not be read)",
+            " (tanpa Recycle Bin, yang tidak terbaca)",
+        ));
+    }
+    text
+}
+
+/// What the report says is still in the bin. Nothing when this delete put nothing there.
+pub fn in_bin_text(r: &DeleteReport) -> Option<String> {
+    (r.bytes_in_bin > 0 || !r.recycled.is_empty()).then(|| {
+        format!(
+            "{} {}",
+            l(
+                "Moved to the Recycle Bin, disk space not freed yet:",
+                "Dipindahkan ke Recycle Bin, belum mengosongkan disk:",
+            ),
+            items_text(r.recycled.len(), r.bytes_in_bin)
+        )
+    })
 }
 
 /// The bin's contents as shown in its confirmation.
@@ -347,11 +419,17 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
     } else {
         DeleteMode::RecycleBin
     };
-    let mut lines = vec![
-        items_text(s.count, s.total),
-        format!("{} {}", l("Mode:", "Mode:"), mode_text(mode)),
-    ];
-    if s.says_not_in_bin {
+    let bin_only = s.bin_only();
+    let mut lines = Vec::new();
+    if s.count > 0 {
+        lines.push(items_text(s.count, s.total));
+    }
+    lines.push(format!(
+        "{} {}",
+        l("Mode:", "Mode:"),
+        confirm_button_text(s, mode)
+    ));
+    if s.says_not_in_bin && !bin_only {
         lines.push(
             l(
                 "These items do not go to the Recycle Bin, so they cannot be restored from it.",
@@ -361,14 +439,25 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
         );
     }
     if let Some(bytes) = s.empty_bin {
-        lines.push(format!(
-            "{} {}",
-            l(
-                "This also empties the Recycle Bin on every drive, including what was in it before. It held:",
-                "Ini juga mengosongkan Recycle Bin di semua drive, termasuk isi yang sudah ada sebelumnya. Isinya:",
-            ),
+        let size = if s.bin_reading {
+            l("reading...", "sedang dibaca...").to_string()
+        } else if s.bin_unread {
+            l("unknown, it could not be read.", "tidak terbaca.").to_string()
+        } else {
             format_size(bytes)
-        ));
+        };
+        let lead = if bin_only {
+            l(
+                "This empties the Recycle Bin on every drive, including what was in it before. It holds:",
+                "Ini mengosongkan Recycle Bin di semua drive, termasuk isi yang sudah ada sebelumnya. Isinya:",
+            )
+        } else {
+            l(
+                "This also empties the Recycle Bin on every drive, including what was in it before. It holds:",
+                "Ini juga mengosongkan Recycle Bin di semua drive, termasuk isi yang sudah ada sebelumnya. Isinya:",
+            )
+        };
+        lines.push(format!("{lead} {size}"));
         lines.push(
             l(
                 "Items in the Recycle Bin cannot be restored afterwards.",
@@ -377,7 +466,7 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
             .to_string(),
         );
     }
-    if context == ConfirmContext::Cleanup {
+    if context == ConfirmContext::Cleanup && !bin_only {
         lines.push(
             l(
                 "Apps create this data again when they need it.",
@@ -396,7 +485,30 @@ pub fn confirm_lines(s: &ConfirmSummary, context: ConfirmContext) -> Vec<String>
             )
         ));
     }
+    if s.holds_more > 0 {
+        lines.push(format!(
+            "{} {}",
+            s.holds_more,
+            l(
+                "of these items may hold more than the size shown: part of what is inside is excluded from scans, could not be read, or was not reached by a cancelled scan.",
+                "item di antaranya mungkin berisi lebih dari ukuran yang tampak: sebagian isinya dikecualikan dari pemindaian, tidak terbaca, atau belum terjangkau pemindaian yang dibatalkan.",
+            )
+        ));
+    }
     lines
+}
+
+/// What the confirm button says, which is also what it does.
+fn confirm_button_text(s: &ConfirmSummary, mode: DeleteMode) -> &'static str {
+    if s.bin_only() {
+        empty_bin_text()
+    } else {
+        mode_text(mode)
+    }
+}
+
+fn empty_bin_text() -> &'static str {
+    l("Empty Recycle Bin", "Kosongkan Recycle Bin")
 }
 
 /// Why an item did not go, in words. `GuardKept` names the guard path and promises
@@ -529,6 +641,18 @@ fn panicked_bin_text() -> String {
 /// whole delete has an outcome, and never again for that flow.
 fn poll_flow(flow: &mut DeleteFlow) -> Option<DeleteReport> {
     match flow {
+        DeleteFlow::Confirm(req) => {
+            if let Some(BinLoad::Loading(job)) = &mut req.bin_load {
+                if let Some(outcome) = job.poll() {
+                    let read = outcome.ok().and_then(Result::ok);
+                    if let Some((bytes, _)) = read {
+                        req.empty_bin = Some(bytes);
+                    }
+                    req.bin_load = Some(BinLoad::Known(read));
+                }
+            }
+            None
+        }
         DeleteFlow::Running(job) => match job.poll()? {
             Err(JobPanicked) => {
                 *flow = DeleteFlow::OutcomeUnknown(DeleteReport::default(), Vec::new());
@@ -608,6 +732,19 @@ fn start_bin_query(ctx: &egui::Context, ops: FlowOps) -> BinLoad {
     BinLoad::Loading(Job::spawn(ctx.clone(), ops.bin_info))
 }
 
+fn open_with(ctx: &egui::Context, mut request: ConfirmRequest, ops: FlowOps) -> DeleteFlow {
+    if request.empty_bin.is_some() {
+        request.bin_load = Some(start_bin_query(ctx, ops));
+    }
+    DeleteFlow::Confirm(request)
+}
+
+/// The confirmation of `request`. One that empties the bin reads the bin again first,
+/// since the size it was made with may be from long ago.
+pub fn open_request(ctx: &egui::Context, request: ConfirmRequest) -> DeleteFlow {
+    open_with(ctx, request, REAL_OPS)
+}
+
 /// The only place a delete or an emptying starts: from `FlowEvent::Confirm` on the
 /// matching dialog. Anything else leaves the state as it was.
 fn apply_event(
@@ -618,6 +755,11 @@ fn apply_event(
     ops: FlowOps,
     guards: &[(DuplicateGroup, Vec<PathBuf>)],
 ) -> Option<DeleteReport> {
+    if event == FlowEvent::Confirm
+        && matches!(flow, DeleteFlow::Confirm(req) if !confirm_summary(req).can_confirm())
+    {
+        return None;
+    }
     let state = std::mem::replace(flow, DeleteFlow::Idle);
     match (state, event) {
         (DeleteFlow::Confirm(req), FlowEvent::Confirm)
@@ -727,25 +869,46 @@ fn confirm_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
     ui.add_enabled(enabled, egui::Button::new(text)).clicked()
 }
 
+/// Room left for what a dialog says once the window has its buttons and its margins.
+pub fn dialog_body_height(window_height: f32, button_row: f32) -> f32 {
+    /// The modal's frame and the gaps around its button row, with some air.
+    const AROUND: f32 = 64.0;
+    (window_height - button_row - AROUND).max(button_row)
+}
+
+/// What a dialog says, scrolling when it is too much for the window. Its buttons go
+/// after this and stay on screen however long the text and the lists are.
+fn dialog_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let max = dialog_body_height(
+        ui.ctx().content_rect().height(),
+        ui.spacing().interact_size.y,
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("flow-body")
+        .max_height(max)
+        .auto_shrink([false, true])
+        .show(ui, add);
+}
+
 fn render_confirm(ui: &mut egui::Ui, req: &ConfirmRequest) -> Option<FlowEvent> {
     let s = confirm_summary(req);
-    ui.heading(l("Confirm", "Konfirmasi"));
-    ui.add_space(6.0);
-    for line in confirm_lines(&s, req.context) {
-        ui.label(line);
-    }
-    ui.add_space(6.0);
-    path_list(ui, "confirm-items", req.items.len(), |i| {
-        req.items[i].path.display().to_string()
+    dialog_body(ui, |ui| {
+        ui.heading(l("Confirm", "Konfirmasi"));
+        ui.add_space(6.0);
+        for line in confirm_lines(&s, req.context) {
+            ui.label(line);
+        }
+        if !req.items.is_empty() {
+            ui.add_space(6.0);
+            path_list(ui, "confirm-items", req.items.len(), |i| {
+                req.items[i].path.display().to_string()
+            });
+        }
     });
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
-        if confirm_button(
-            ui,
-            s.count > 0 || s.empty_bin.is_some(),
-            mode_text(req.mode),
-        ) {
+        if confirm_button(ui, s.can_confirm(), confirm_button_text(&s, req.mode)) {
             event = Some(FlowEvent::Confirm);
         }
         if ui.button(l("Cancel", "Batal")).clicked() {
@@ -756,40 +919,43 @@ fn render_confirm(ui: &mut egui::Ui, req: &ConfirmRequest) -> Option<FlowEvent> 
 }
 
 fn render_offer(ui: &mut egui::Ui, offer: &mut PermanentOffer) -> Option<FlowEvent> {
-    ui.heading(l("Delete permanently?", "Hapus permanen?"));
-    ui.add_space(6.0);
-    ui.label(offer_text());
-    ui.add_space(6.0);
-    let height = ui.spacing().interact_size.y;
-    let PermanentOffer { items, checked } = offer;
-    egui::ScrollArea::vertical()
-        .id_salt("offer-items")
-        .max_height(160.0)
-        .auto_shrink([false, true])
-        .show_rows(ui, height, items.len(), |ui, range| {
-            for i in range {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut checked[i], "");
-                    ui.add(
-                        egui::Label::new(format!(
-                            "{}  ({})",
-                            items[i].path.display(),
-                            format_size(items[i].size)
-                        ))
-                        .truncate(),
-                    );
-                });
-            }
-        });
+    dialog_body(ui, |ui| {
+        ui.heading(l("Delete permanently?", "Hapus permanen?"));
+        ui.add_space(6.0);
+        ui.label(offer_text());
+        ui.add_space(6.0);
+        let height = ui.spacing().interact_size.y;
+        let PermanentOffer { items, checked } = &mut *offer;
+        egui::ScrollArea::vertical()
+            .id_salt("offer-items")
+            .max_height(160.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, height, items.len(), |ui, range| {
+                for i in range {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut checked[i], "");
+                        ui.add(
+                            egui::Label::new(format!(
+                                "{}  ({})",
+                                items[i].path.display(),
+                                format_size(items[i].size)
+                            ))
+                            .truncate(),
+                        );
+                    });
+                }
+            });
+        let picked = offer.selected();
+        let total: u64 = picked.iter().map(|t| t.size).sum();
+        ui.add_space(6.0);
+        ui.label(items_text(picked.len(), total));
+        ui.label(format!(
+            "{} {}",
+            l("Mode:", "Mode:"),
+            mode_text(DeleteMode::Permanent)
+        ));
+    });
     let picked = offer.selected();
-    let total: u64 = picked.iter().map(|t| t.size).sum();
-    ui.add_space(6.0);
-    ui.label(items_text(picked.len(), total));
-    ui.label(format!(
-        "{} {}",
-        l("Mode:", "Mode:"),
-        mode_text(DeleteMode::Permanent)
-    ));
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
@@ -804,24 +970,18 @@ fn render_offer(ui: &mut egui::Ui, offer: &mut PermanentOffer) -> Option<FlowEve
 }
 
 /// The numbers and lists of a report. `in_bin_line` is off once the bin reads as
-/// empty, since those items are no longer there.
-fn report_body(ui: &mut egui::Ui, r: &DeleteReport, in_bin_line: bool, context: ConfirmContext) {
-    let s = report_summary(r);
-    if in_bin_line {
-        ui.label(format!(
-            "{} {}",
-            l(
-                "Moved to the Recycle Bin, disk space not freed yet:",
-                "Dipindahkan ke Recycle Bin, belum mengosongkan disk:",
-            ),
-            format_size(s.in_bin)
-        ));
+/// empty, since those items are no longer there. `gained` is the bold line.
+fn report_body(
+    ui: &mut egui::Ui,
+    r: &DeleteReport,
+    in_bin_line: bool,
+    gained: String,
+    context: ConfirmContext,
+) {
+    if let Some(line) = in_bin_text(r).filter(|_| in_bin_line) {
+        ui.label(line);
     }
-    ui.strong(format!(
-        "{} {}",
-        l("Space gained:", "Ruang yang didapat:"),
-        format_size(s.freed)
-    ));
+    ui.strong(gained);
     if !r.removed.is_empty() {
         ui.add_space(4.0);
         ui.weak(l("Deleted for good:", "Terhapus permanen:"));
@@ -878,10 +1038,7 @@ fn close_button(ui: &mut egui::Ui, event: &mut Option<FlowEvent>) {
 }
 
 fn empty_bin_button(ui: &mut egui::Ui, event: &mut Option<FlowEvent>) {
-    if ui
-        .button(l("Empty Recycle Bin", "Kosongkan Recycle Bin"))
-        .clicked()
-    {
+    if ui.button(empty_bin_text()).clicked() {
         *event = Some(FlowEvent::AskEmptyBin);
     }
 }
@@ -891,9 +1048,11 @@ fn render_report(
     r: &DeleteReport,
     context: ConfirmContext,
 ) -> Option<FlowEvent> {
-    ui.heading(l("Report", "Laporan"));
-    ui.add_space(6.0);
-    report_body(ui, r, true, context);
+    dialog_body(ui, |ui| {
+        ui.heading(l("Report", "Laporan"));
+        ui.add_space(6.0);
+        report_body(ui, r, true, space_gained_text(r.bytes_freed), context);
+    });
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
@@ -924,14 +1083,14 @@ fn render_empty_bin(ui: &mut egui::Ui, load: &BinLoad) -> Option<FlowEvent> {
         }
     }
     ui.label(l(
-        "This covers every drive and everything in the bin, including what was there before. Items cannot be restored afterwards. Windows may ask once more.",
-        "Ini mencakup semua drive dan seluruh isi Recycle Bin, termasuk yang sudah ada sebelumnya. Isinya tidak bisa dipulihkan setelah itu. Windows mungkin bertanya sekali lagi.",
+        "This covers every drive and everything in the bin, including what was there before. Items cannot be restored afterwards.",
+        "Ini mencakup semua drive dan seluruh isi Recycle Bin, termasuk yang sudah ada sebelumnya. Isinya tidak bisa dipulihkan setelah itu.",
     ));
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
         let ready = matches!(load, BinLoad::Known(_));
-        if confirm_button(ui, ready, l("Empty Recycle Bin", "Kosongkan Recycle Bin")) {
+        if confirm_button(ui, ready, empty_bin_text()) {
             event = Some(FlowEvent::Confirm);
         }
         if ui.button(l("Cancel", "Batal")).clicked() {
@@ -947,10 +1106,12 @@ fn render_emptied(
     b: &BinEmptied,
     context: ConfirmContext,
 ) -> Option<FlowEvent> {
-    ui.heading(l("Report", "Laporan"));
-    ui.add_space(6.0);
-    ui.label(bin_result_text(b));
-    report_body(ui, r, !b.is_empty_now(), context);
+    dialog_body(ui, |ui| {
+        ui.heading(l("Report", "Laporan"));
+        ui.add_space(6.0);
+        ui.label(bin_result_text(b));
+        report_body(ui, r, !b.is_empty_now(), emptied_gain_text(r, b), context);
+    });
     ui.add_space(8.0);
     let mut event = None;
     ui.horizontal(|ui| {
@@ -968,28 +1129,30 @@ fn render_unknown(
     unknown: &[Target],
     context: ConfirmContext,
 ) -> Option<FlowEvent> {
-    ui.heading(l("Outcome unknown", "Hasil tidak diketahui"));
-    ui.add_space(6.0);
-    ui.label(unknown_outcome_text());
-    if !unknown.is_empty() {
+    dialog_body(ui, |ui| {
+        ui.heading(l("Outcome unknown", "Hasil tidak diketahui"));
         ui.add_space(6.0);
-        ui.strong(l(
-            "Sent to delete permanently, outcome unknown:",
-            "Dikirim untuk dihapus permanen, hasil tidak diketahui:",
-        ));
-        path_list(ui, "unknown-items", unknown.len(), |i| {
-            unknown[i].path.display().to_string()
-        });
-    }
-    let s = report_summary(proven);
-    if s.freed > 0 || s.offer_empty_bin || s.failed > 0 {
-        ui.add_space(6.0);
-        ui.weak(l(
-            "Known from the step before it:",
-            "Yang diketahui dari langkah sebelumnya:",
-        ));
-        report_body(ui, proven, true, context);
-    }
+        ui.label(unknown_outcome_text());
+        if !unknown.is_empty() {
+            ui.add_space(6.0);
+            ui.strong(l(
+                "Sent to delete permanently, outcome unknown:",
+                "Dikirim untuk dihapus permanen, hasil tidak diketahui:",
+            ));
+            path_list(ui, "unknown-items", unknown.len(), |i| {
+                unknown[i].path.display().to_string()
+            });
+        }
+        let s = report_summary(proven);
+        if s.freed > 0 || s.offer_empty_bin || s.failed > 0 {
+            ui.add_space(6.0);
+            ui.weak(l(
+                "Known from the step before it:",
+                "Yang diketahui dari langkah sebelumnya:",
+            ));
+            report_body(ui, proven, true, space_gained_text(s.freed), context);
+        }
+    });
     ui.add_space(8.0);
     let mut event = None;
     close_button(ui, &mut event);
@@ -1097,8 +1260,10 @@ mod tests {
             items: vec![t(r"C:\t\a", 10), t(r"C:\t\b", 5)],
             mode,
             warn_app_owned: 0,
+            warn_holds_more: 0,
             context,
             empty_bin: None,
+            bin_load: None,
             guards: Vec::new(),
         }
     }
@@ -1151,6 +1316,7 @@ mod tests {
         let mut reports = Vec::new();
         while flow.is_working()
             || matches!(flow, DeleteFlow::ConfirmEmptyBin(_, BinLoad::Loading(_)))
+            || matches!(&flow, DeleteFlow::Confirm(req) if confirm_summary(req).bin_reading)
         {
             reports.extend(poll_flow(flow));
             assert!(start.elapsed() < Duration::from_secs(5));
@@ -1372,8 +1538,10 @@ mod tests {
             items: Vec::new(),
             mode: DeleteMode::Permanent,
             warn_app_owned: 0,
+            warn_holds_more: 0,
             context: ConfirmContext::User,
             empty_bin: None,
+            bin_load: None,
             guards: Vec::new(),
         });
         let ctx = egui::Context::default();
@@ -1619,7 +1787,7 @@ mod tests {
         assert!(emptied.contains("3 items"));
         assert!(emptied.contains("2.0 KiB"));
 
-        // The user said no in Windows' own dialog: same contents, no error.
+        // Nothing went, and no error says why: same contents.
         let declined = bin_result_text(&result(Some((2048, 3)), Some((2048, 3)), None));
         assert!(declined.contains("not emptied"));
 
@@ -1630,6 +1798,284 @@ mod tests {
 
         let unread = bin_result_text(&result(None, None, None));
         assert!(unread.contains("unknown"));
+    }
+
+    fn emptied(before: Option<(u64, u64)>, after: Option<(u64, u64)>) -> BinEmptied {
+        BinEmptied {
+            before,
+            after,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn what_the_bin_gave_back_comes_from_reading_it_before_and_after() {
+        assert_eq!(
+            bin_released(&emptied(Some((2048, 3)), Some((0, 0)))),
+            Some(2048)
+        );
+        assert_eq!(
+            bin_released(&emptied(Some((2048, 3)), Some((1024, 1)))),
+            Some(1024)
+        );
+        // Something else recycled meanwhile: no space was lost by emptying.
+        assert_eq!(bin_released(&emptied(Some((5, 1)), Some((50, 2)))), Some(0));
+        assert_eq!(bin_released(&emptied(None, Some((0, 0)))), None);
+        assert_eq!(bin_released(&emptied(Some((5, 1)), None)), None);
+    }
+
+    #[test]
+    fn the_emptied_report_counts_the_bin_as_space_gained() {
+        let moved = DeleteReport {
+            recycled: vec![PathBuf::from(r"C:\t\a")],
+            bytes_in_bin: 2048,
+            ..Default::default()
+        };
+        let text = emptied_gain_text(&moved, &emptied(Some((2048, 1)), Some((0, 0))));
+        assert!(text.contains("Space gained: 2.0 KiB"), "{text}");
+        // What the delete freed on its own is added, and only that much for an unread bin.
+        let freed = DeleteReport {
+            bytes_freed: 1024,
+            ..Default::default()
+        };
+        let text = emptied_gain_text(&freed, &emptied(Some((2048, 1)), Some((0, 0))));
+        assert!(text.contains("Space gained: 3.0 KiB"), "{text}");
+        let text = emptied_gain_text(&freed, &emptied(None, None));
+        assert!(text.contains("Space gained: 1.0 KiB"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+    }
+
+    #[test]
+    fn a_bin_only_request_speaks_of_the_bin_and_not_of_items() {
+        let s = confirm_summary(&cleanup_req(Vec::new(), Some(2048)));
+        let lines = confirm_lines(&s, ConfirmContext::Cleanup).join("\n");
+        assert!(!lines.contains("0 items"), "{lines}");
+        assert!(!lines.contains("do not go to the Recycle Bin"), "{lines}");
+        assert!(!lines.contains("create this data again"), "{lines}");
+        assert!(lines.contains("empties the Recycle Bin"), "{lines}");
+        assert!(lines.contains("2.0 KiB"), "{lines}");
+        assert_eq!(
+            confirm_button_text(&s, DeleteMode::Permanent),
+            "Empty Recycle Bin"
+        );
+        // With items the button still says what happens to the items.
+        let s = confirm_summary(&cleanup_req(vec![t(r"C:\t\a", 10)], Some(2048)));
+        assert_eq!(
+            confirm_button_text(&s, DeleteMode::Permanent),
+            mode_text(DeleteMode::Permanent)
+        );
+        assert!(confirm_lines(&s, ConfirmContext::Cleanup)
+            .join("\n")
+            .contains("1 items"));
+    }
+
+    #[test]
+    fn the_bin_line_of_a_report_is_there_only_when_the_bin_was_used() {
+        let permanent = DeleteReport {
+            removed: vec![PathBuf::from(r"C:\t\a")],
+            bytes_freed: 10,
+            ..Default::default()
+        };
+        assert_eq!(in_bin_text(&permanent), None);
+        let recycled = DeleteReport {
+            recycled: vec![PathBuf::from(r"C:\t\a"), PathBuf::from(r"C:\t\b")],
+            bytes_in_bin: 2048,
+            ..Default::default()
+        };
+        let line = in_bin_text(&recycled).unwrap();
+        assert!(
+            line.contains("2 items") && line.contains("2.0 KiB"),
+            "{line}"
+        );
+        let empty_file = DeleteReport {
+            recycled: vec![PathBuf::from(r"C:\t\a")],
+            ..Default::default()
+        };
+        assert!(in_bin_text(&empty_file).unwrap().contains("1 items"));
+    }
+
+    #[test]
+    fn the_warning_on_what_items_hold_is_a_plain_count() {
+        let mut r = req(DeleteMode::RecycleBin, ConfirmContext::User);
+        let quiet = confirm_lines(&confirm_summary(&r), r.context).join("\n");
+        assert!(!quiet.contains("may hold more"));
+        r.warn_holds_more = 2;
+        let lines = confirm_lines(&confirm_summary(&r), r.context).join("\n");
+        assert!(lines.contains("2 of these items may hold more"), "{lines}");
+    }
+
+    fn info_900() -> io::Result<(u64, u64)> {
+        Ok((900, 3))
+    }
+    fn info_empty() -> io::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+    fn info_fails() -> io::Result<(u64, u64)> {
+        Err(io::Error::other("no"))
+    }
+
+    fn reopened(info: fn() -> io::Result<(u64, u64)>, items: Vec<Target>) -> DeleteFlow {
+        let ops = FlowOps {
+            bin_info: info,
+            ..NO_OPS
+        };
+        open_with(&egui::Context::default(), cleanup_req(items, Some(5)), ops)
+    }
+
+    fn summary_of(flow: &DeleteFlow) -> ConfirmSummary {
+        let DeleteFlow::Confirm(req) = flow else {
+            panic!("expected the confirmation");
+        };
+        confirm_summary(req)
+    }
+
+    #[test]
+    fn a_request_with_the_bin_reads_it_again_when_it_opens() {
+        let mut flow = reopened(info_900, Vec::new());
+        assert!(settle(&mut flow).is_empty());
+        let s = summary_of(&flow);
+        assert_eq!(s.empty_bin, Some(900));
+        assert!(!s.bin_reading && !s.bin_unread && s.can_confirm());
+        let lines = confirm_lines(&s, ConfirmContext::Cleanup).join("\n");
+        assert!(lines.contains("900 B"), "{lines}");
+    }
+
+    #[test]
+    fn a_bin_found_empty_leaves_nothing_to_confirm_but_items_still_can_go() {
+        let mut flow = reopened(info_empty, Vec::new());
+        settle(&mut flow);
+        assert!(!summary_of(&flow).can_confirm());
+        let ctx = egui::Context::default();
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS, &[]);
+        assert!(matches!(flow, DeleteFlow::Confirm(_)));
+
+        let mut flow = reopened(info_empty, vec![t(r"C:\t\a", 1)]);
+        settle(&mut flow);
+        assert!(summary_of(&flow).can_confirm());
+    }
+
+    #[test]
+    fn a_bin_that_cannot_be_read_says_so_and_stays_the_users_choice() {
+        let mut flow = reopened(info_fails, Vec::new());
+        settle(&mut flow);
+        let s = summary_of(&flow);
+        assert!(s.bin_unread && s.can_confirm());
+        let lines = confirm_lines(&s, ConfirmContext::Cleanup).join("\n");
+        assert!(lines.contains("could not be read"), "{lines}");
+        assert!(!lines.contains("5 B"), "{lines}");
+    }
+
+    #[test]
+    fn confirming_while_the_bin_is_being_read_does_nothing() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let job = Job::spawn(ctx.clone(), move || {
+            let _ = rx.recv();
+            Ok((1, 1))
+        });
+        let mut request = cleanup_req(Vec::new(), Some(5));
+        request.bin_load = Some(BinLoad::Loading(job));
+        let mut flow = DeleteFlow::Confirm(request);
+        apply_event(&ctx, &mut flow, FlowEvent::Confirm, &protect(), NO_OPS, &[]);
+        assert!(matches!(flow, DeleteFlow::Confirm(_)));
+        let lines = confirm_lines(&summary_of(&flow), ConfirmContext::Cleanup).join("\n");
+        assert!(lines.contains("reading"), "{lines}");
+        tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_request_without_the_bin_reads_nothing() {
+        let flow = open_with(
+            &egui::Context::default(),
+            cleanup_req(vec![t(r"C:\t\a", 1)], None),
+            NO_OPS,
+        );
+        assert!(!summary_of(&flow).bin_reading);
+    }
+
+    /// Runs the flow in a window of the app's minimum size, as often as a layout needs.
+    fn drawn(flow: &mut DeleteFlow) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let p = protect();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 520.0),
+            )),
+            ..Default::default()
+        };
+        let mut last = None;
+        for _ in 0..4 {
+            let mut out = ctx.run_ui(input(), |ui| {
+                drive_flow(ui.ctx(), flow, &p, ConfirmContext::User, NO_OPS, &[]);
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        last.unwrap()
+    }
+
+    fn long_report() -> DeleteReport {
+        let rows = |prefix: &str| -> Vec<PathBuf> {
+            (0..200)
+                .map(|i| PathBuf::from(format!(r"C:\t\{prefix}{i}")))
+                .collect()
+        };
+        let mut failed: Vec<Failed> = (0..60)
+            .map(|i| {
+                fail(
+                    &format!(r"C:\t\guard{i}"),
+                    1,
+                    FailReason::GuardKept(format!(r"C:\t\.g{i}").into()),
+                )
+            })
+            .collect();
+        failed.extend((0..200).map(|i| fail(&format!(r"C:\t\f{i}"), 1, FailReason::InUse)));
+        DeleteReport {
+            removed: rows("r"),
+            recycled: rows("b"),
+            failed,
+            bytes_freed: 1,
+            bytes_in_bin: 1,
+        }
+    }
+
+    /// Where the button or label with exactly this text was drawn, if it was.
+    fn text_rect(out: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+        out.shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(egui::Rect::from_min_size(shape.pos, shape.galley.size()))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_buttons_of_a_long_report_stay_inside_the_smallest_window() {
+        for mut flow in [
+            DeleteFlow::Report(long_report()),
+            DeleteFlow::Emptied(long_report(), emptied(Some((9, 9)), Some((1, 1)))),
+            DeleteFlow::OutcomeUnknown(long_report(), vec![t(r"C:\t\sent", 1)]),
+        ] {
+            let out = drawn(&mut flow);
+            let close = text_rect(&out, "Close").expect("the Close button is drawn");
+            assert!(close.max.y <= 520.0, "Close at {close:?}");
+            assert!(close.min.y >= 0.0, "Close at {close:?}");
+        }
+    }
+
+    #[test]
+    fn the_buttons_of_a_long_confirmation_stay_inside_the_smallest_window() {
+        let mut request = cleanup_req(
+            (0..500).map(|i| t(&format!(r"C:\t\i{i}"), 1)).collect(),
+            Some(9),
+        );
+        request.warn_app_owned = 3;
+        request.warn_holds_more = 3;
+        let mut flow = DeleteFlow::Confirm(request);
+        let out = drawn(&mut flow);
+        let cancel = text_rect(&out, "Cancel").expect("the Cancel button is drawn");
+        assert!(cancel.max.y <= 520.0, "Cancel at {cancel:?}");
     }
 
     #[test]
@@ -1704,8 +2150,10 @@ mod tests {
             items,
             mode: DeleteMode::Permanent,
             warn_app_owned: 0,
+            warn_holds_more: 0,
             context: ConfirmContext::Cleanup,
             empty_bin,
+            bin_load: None,
             guards: Vec::new(),
         }
     }

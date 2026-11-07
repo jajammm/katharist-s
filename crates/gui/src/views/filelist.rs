@@ -342,6 +342,7 @@ pub fn show_list(
         ui,
         tree,
         &list.flags,
+        home.scan_excluded(),
         &list.selection,
         home.marks().is_some(),
         home.map_stale(),

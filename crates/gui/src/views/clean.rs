@@ -3,12 +3,14 @@
 //! confirmation flow, after the user confirms what the request lists.
 
 use std::collections::HashSet;
+use std::io;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use katharistis_core::delete::{DeleteMode, Target};
 use katharistis_core::format::format_size;
 use katharistis_core::junk::{scan_junk, JunkCategory, JunkItem, JunkKind, JunkRoots};
+use katharistis_core::recycle;
 use katharistis_core::scan::ScanProgress;
 
 use crate::confirm::{ConfirmContext, ConfirmRequest};
@@ -42,6 +44,18 @@ pub fn with_bin_marker(mut cats: Vec<JunkCategory>) -> Vec<JunkCategory> {
         }];
     }
     cats
+}
+
+/// Brings the bin's size in line with a new reading. An empty bin cannot stay ticked;
+/// any other tick stays what the user made it.
+pub fn set_bin_size(cats: &mut [JunkCategory], bytes: u64) {
+    for cat in cats.iter_mut().filter(|c| is_bin(c)) {
+        cat.bin_size = bytes;
+        for item in &mut cat.items {
+            item.size = bytes;
+            item.checked &= bytes > 0;
+        }
+    }
 }
 
 fn bin_ticked(cat: &JunkCategory) -> bool {
@@ -109,8 +123,10 @@ pub fn request_from(cats: &[JunkCategory]) -> Option<ConfirmRequest> {
         items,
         mode: DeleteMode::Permanent,
         warn_app_owned: 0,
+        warn_holds_more: 0,
         context: ConfirmContext::Cleanup,
         empty_bin: empty_bin.then_some(bin_size),
+        bin_load: None,
         guards: Vec::new(),
     })
 }
@@ -143,6 +159,7 @@ pub struct CleanState {
     failed: bool,
     /// The excluded folders the list was made with.
     excluded: Vec<PathBuf>,
+    bin_job: Option<Job<io::Result<(u64, u64)>>>,
 }
 
 impl CleanState {
@@ -167,9 +184,26 @@ impl CleanState {
         self.scan = Some(RunningScan { job, progress });
     }
 
+    /// Reads the bin again. Any finished flow, from any screen, can have changed it.
+    pub fn refresh_bin(&mut self, ctx: &egui::Context) {
+        self.read_bin(ctx, recycle::bin_info);
+    }
+
+    fn read_bin(&mut self, ctx: &egui::Context, read: fn() -> io::Result<(u64, u64)>) {
+        if self.started {
+            self.bin_job = Some(Job::spawn(ctx.clone(), read));
+        }
+    }
+
     /// Takes in a finished scan. Runs every frame, so a scan finishes also while
     /// another tool is open.
     pub fn poll(&mut self) {
+        if let Some(outcome) = self.bin_job.as_mut().and_then(Job::poll) {
+            self.bin_job = None;
+            if let Ok(Ok((bytes, _))) = outcome {
+                set_bin_size(&mut self.cats, bytes);
+            }
+        }
         let Some(outcome) = self.scan.as_mut().and_then(|s| s.job.poll()) else {
             return;
         };
@@ -483,6 +517,78 @@ mod tests {
         let r = request_from(&cats).unwrap();
         assert!(r.items.is_empty());
         assert_eq!(r.empty_bin, Some(900));
+    }
+
+    #[test]
+    fn a_new_bin_size_opens_the_tick_and_an_empty_bin_closes_it() {
+        let mut cats = vec![bin(0, false)];
+        set_category(&mut cats[0], true);
+        assert!(!selected_targets(&cats).1, "an empty bin takes no tick");
+
+        // Something went to the bin on another screen.
+        set_bin_size(&mut cats, 900);
+        set_category(&mut cats[0], true);
+        assert!(selected_targets(&cats).1);
+        assert_eq!(selected_total(&cats), 900);
+        assert_eq!(request_from(&cats).unwrap().empty_bin, Some(900));
+
+        // It changed again, and the tick stays.
+        set_bin_size(&mut cats, 1200);
+        assert_eq!(request_from(&cats).unwrap().empty_bin, Some(1200));
+
+        // It was emptied: nothing left to tick.
+        set_bin_size(&mut cats, 0);
+        assert!(!selected_targets(&cats).1);
+        assert!(!cats[0].items[0].checked);
+        assert!(request_from(&cats).is_none());
+    }
+
+    #[test]
+    fn the_size_of_other_categories_is_left_alone() {
+        let mut cats = vec![
+            cat(JunkKind::Temp, vec![item("a", 10, true)]),
+            bin(5, false),
+        ];
+        set_bin_size(&mut cats, 900);
+        assert_eq!(cats[0].items[0].size, 10);
+        assert!(cats[0].items[0].checked);
+        assert_eq!(cats[0].bin_size, 0);
+    }
+
+    fn fake_bin() -> io::Result<(u64, u64)> {
+        Ok((700, 2))
+    }
+
+    fn poll_until_read(state: &mut CleanState) {
+        let start = std::time::Instant::now();
+        while state.bin_job.is_some() {
+            state.poll();
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn reading_the_bin_after_a_flow_reaches_the_list() {
+        let ctx = egui::Context::default();
+        let mut state = CleanState {
+            cats: vec![bin(0, false)],
+            started: true,
+            ..Default::default()
+        };
+        state.read_bin(&ctx, fake_bin);
+        poll_until_read(&mut state);
+        assert_eq!(state.cats[0].bin_size, 700);
+        assert_eq!(state.cats[0].items[0].size, 700);
+    }
+
+    #[test]
+    fn a_screen_never_opened_reads_nothing() {
+        let mut state = CleanState::default();
+        state.read_bin(&egui::Context::default(), || {
+            panic!("the screen has no list to update")
+        });
+        assert!(state.bin_job.is_none());
     }
 
     #[test]
