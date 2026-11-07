@@ -6,20 +6,24 @@ use std::path::{Component, Path, Prefix};
 use std::time::{Duration, SystemTime};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SUPPORTED, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, CreateHardLinkW, DeleteFileW, FileDispositionInfoEx, FindClose, FindExInfoBasic,
-    FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW,
-    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW,
-    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, MoveFileExW, RemoveDirectoryW,
-    SetFileAttributesW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
-    FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_FLAG_DELETE,
+    CreateFileW, CreateHardLinkW, DeleteFileW, FileDispositionInfoEx, FileIdExtdDirectoryInfo,
+    FileIdExtdDirectoryRestartInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    GetLongPathNameW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, MoveFileExW,
+    RemoveDirectoryW, SetFileAttributesW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FIND_FIRST_EX_LARGE_FETCH, GETFINALPATHNAMEBYHANDLE_FLAGS, MOVE_FILE_FLAGS, OPEN_EXISTING,
-    VOLUME_NAME_DOS, WIN32_FIND_DATAW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO,
+    FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FIND_FIRST_EX_LARGE_FETCH, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    MOVE_FILE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS, WIN32_FIND_DATAW,
 };
 
 /// `*`, `?` and the three characters Win32 also treats as DOS wildcards.
@@ -147,8 +151,11 @@ pub struct DirEntry {
 }
 
 fn filetime_to_system(ft: FILETIME) -> Option<SystemTime> {
+    ticks_to_system((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime))
+}
+
+fn ticks_to_system(ticks: u64) -> Option<SystemTime> {
     const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
-    let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
     let since_unix = ticks.checked_sub(UNIX_EPOCH_TICKS)?;
     let nanos = since_unix % 10_000_000 * 100;
     Some(SystemTime::UNIX_EPOCH + Duration::new(since_unix / 10_000_000, nanos as u32))
@@ -208,6 +215,137 @@ pub fn list_dir(p: &Path) -> io::Result<Vec<DirEntry>> {
     };
     let _ = unsafe { FindClose(handle) };
     result.map(|()| out)
+}
+
+/// What the directory itself knows about a file, without opening the file.
+#[derive(Clone, Copy)]
+pub struct SizedInfo {
+    pub logical: u64,
+    pub allocated: u64,
+    /// Unique on one volume; all zero when the file system has no such id.
+    pub id: [u8; 16],
+}
+
+/// One entry for the scan. `sized` is `None` when the file system could not
+/// report it with the listing.
+pub struct ScanEntry {
+    pub name: String,
+    pub attrs: u32,
+    /// Reparse tag; only meaningful when `attrs` has the reparse point bit.
+    pub reparse_tag: u32,
+    pub modified: Option<SystemTime>,
+    pub sized: Option<SizedInfo>,
+}
+
+/// `list_dir`, in the shape the scan takes.
+pub fn list_dir_plain(p: &Path) -> io::Result<Vec<ScanEntry>> {
+    Ok(list_dir(p)?
+        .into_iter()
+        .map(|e| ScanEntry {
+            name: e.name,
+            attrs: e.attrs,
+            reparse_tag: e.reparse_tag,
+            modified: e.modified,
+            sized: None,
+        })
+        .collect())
+}
+
+/// Lists a directory with sizes and file ids in one go, so the scan need not
+/// open each file, which took about 90% of a full scan. Falls back to
+/// `list_dir_plain` on a file system without this information class.
+pub fn list_dir_sized(p: &Path) -> io::Result<Vec<ScanEntry>> {
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; 128 * 1024 / 8]);
+    }
+    let wide = to_long_path(p);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(io::Error::from)?;
+
+    let mut out = Vec::new();
+    let mut class = FileIdExtdDirectoryRestartInfo;
+    let unsupported = BUFFER.with(|buffer| -> io::Result<bool> {
+        let mut buffer = buffer.borrow_mut();
+        let bytes = (buffer.len() * 8) as u32;
+        let mut first = true;
+        loop {
+            let read = unsafe {
+                GetFileInformationByHandleEx(handle, class, buffer.as_mut_ptr().cast(), bytes)
+            };
+            class = FileIdExtdDirectoryInfo;
+            if let Err(e) = read {
+                let code = e.code();
+                // An empty drive root has no `.` entry, so its first read finds nothing.
+                let empty_root = first && code == ERROR_FILE_NOT_FOUND.to_hresult();
+                if code == ERROR_NO_MORE_FILES.to_hresult() || empty_root {
+                    return Ok(false);
+                }
+                let not_here = [
+                    ERROR_INVALID_PARAMETER,
+                    ERROR_INVALID_FUNCTION,
+                    ERROR_NOT_SUPPORTED,
+                ]
+                .iter()
+                .any(|known| code == known.to_hresult());
+                return if first && not_here {
+                    Ok(true)
+                } else {
+                    Err(io::Error::from(e))
+                };
+            }
+            first = false;
+            let mut offset = 0usize;
+            loop {
+                // SAFETY: the system wrote a chain of 8-aligned records into the buffer.
+                let info = unsafe {
+                    &*buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_EXTD_DIR_INFO>()
+                };
+                let name = unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::addr_of!(info.FileName).cast::<u16>(),
+                        info.FileNameLength as usize / 2,
+                    )
+                };
+                if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    out.push(ScanEntry {
+                        name: String::from_utf16_lossy(name),
+                        attrs: info.FileAttributes,
+                        reparse_tag: info.ReparsePointTag,
+                        modified: ticks_to_system(info.LastWriteTime as u64),
+                        sized: Some(SizedInfo {
+                            logical: info.EndOfFile as u64,
+                            allocated: info.AllocationSize as u64,
+                            id: info.FileId.Identifier,
+                        }),
+                    });
+                }
+                if info.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += info.NextEntryOffset as usize;
+            }
+        }
+    });
+    let _ = unsafe { CloseHandle(handle) };
+    if unsupported? {
+        return list_dir_plain(p);
+    }
+    Ok(out)
 }
 
 /// The directory entry of `p` itself, without following it if it is a link. The

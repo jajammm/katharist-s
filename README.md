@@ -1,142 +1,142 @@
 # Katharistís
 
-Pembersih disk untuk Windows, ditulis dengan Rust. Sekali pindai, peta disk menunjukkan apa yang memakan tempat, jadi Anda tidak perlu membuka folder satu per satu. Keputusan menghapus tetap di tangan Anda: berkas pribadi tidak pernah tercentang otomatis.
+A disk cleaner for Windows, written in Rust. One scan shows what is taking up space on a disk map, so you don't have to open folders one by one. You decide what gets deleted: personal files are never ticked automatically.
 
-Dua program, keduanya portabel (satu `.exe`, tanpa installer, tanpa hak admin), untuk Windows 10 ke atas:
+There are two programs, both portable (a single `.exe`, no installer, no admin rights), for Windows 10 and later:
 
-- `katharistis-gui.exe`: aplikasi dengan antarmuka grafis, dalam Bahasa Indonesia dan Inggris.
-- `katharistis.exe`: laporan penggunaan disk di terminal. Hanya membaca, tidak pernah menghapus.
+- `katharistis-gui.exe`: the graphical app, in English and Indonesian.
+- `katharistis.exe`: a disk usage report in the terminal. It only reads and never deletes.
 
 ## Status
 
-Versi 0.1.0, belum ada rilis siap unduh. Test otomatis lolos, tetapi alur antarmuka grafis dengan data sungguhan masih menunggu uji manual, jadi cobalah dulu pada folder uji sebelum menghapus data penting.
+Version 0.1.0, with no downloadable release yet. The automated tests pass, but the graphical app's flow with real data is still waiting on manual testing, so try it on a test folder before deleting anything important.
 
-## Membangun
+## Building
 
 ```
 cargo build --release --workspace
 cargo test --workspace
 ```
 
-Perlu Rust stable dengan target `x86_64-pc-windows-msvc` dan `rc.exe` dari Windows SDK. Hasil build ada di `target\release\`.
+This needs stable Rust with the `x86_64-pc-windows-msvc` target and `rc.exe` from the Windows SDK. The build output is in `target\release\`.
 
-Test biasa tidak menyentuh Recycle Bin. Test yang memakai Recycle Bin sungguhan ditandai `#[ignore]` dan menaruh berkas uji `katharistis-test-*` ke sana, jadi jalankan hanya bila perlu:
+The normal tests don't touch the Recycle Bin. Tests that use the real Recycle Bin are marked `#[ignore]` and put `katharistis-test-*` files in it, so run them only when needed:
 
 ```
 cargo test -p katharistis-core -- --ignored --test-threads=1
 ```
 
-## Fitur
+## Features
 
-### Beranda
+### Home
 
-Pilih drive atau ketik folder, lalu tekan **Pindai**. Peta disk menampilkan isi lokasi sebagai kotak. Klik kotak untuk masuk lebih dalam, dan pakai jejak lokasi untuk kembali. Warna kotak membedakan jenis area, tanpa skor bahaya.
+Pick a drive or type a folder, then press **Scan**. The disk map shows the contents of the location as boxes. Click a box to go deeper, and use the breadcrumb to go back. Box colors tell kinds of area apart, and there are no danger scores.
 
-Panel di sampingnya mendaftar isi lokasi saat ini dari yang terbesar, dengan tanggal terakhir diubah. Item yang sudah lama ditandai warna (ambang bawaan 1 tahun). Item yang dicentang dipindahkan ke Recycle Bin, sedangkan hapus permanen harus dipilih sendiri.
+The panel beside it lists the current location from largest to smallest, with the last modified date. Items that are old get a color mark (the default threshold is 1 year). Ticked items move to the Recycle Bin, and permanent deletion has to be chosen separately.
 
-Pada pindaian satu drive, panel "Lainnya" menjelaskan selisih antara total pindaian dan ruang terpakai: `pagefile.sys`, `hiberfil.sys`, `swapfile.sys`, System Volume Information, dan folder yang tidak terbaca beserta alasannya.
+On a whole-drive scan, the "Other" panel explains the gap between the scanned total and the space in use: `pagefile.sys`, `hiberfil.sys`, `swapfile.sys`, System Volume Information, and unreadable folders with the reason for each.
 
-### Pembersihan
+### Cleanup
 
-Item di layar ini dihapus permanen karena bisa dibuat ulang oleh aplikasinya, dan konfirmasinya menyebut hal itu. Hanya lokasi di bawah akun pengguna sendiri yang dibersihkan. `C:\Windows\Temp` dan cache Windows Update tidak termasuk karena butuh hak admin.
+Items on this screen are deleted permanently because their apps can recreate them, and the confirmation says so. Only locations under your own user account are cleaned. `C:\Windows\Temp` and the Windows Update cache are left out because they need admin rights.
 
-| Kategori | Lokasi | Tercentang awal |
+| Category | Location | Ticked at start |
 |---|---|---|
-| File sementara | Isi `%TEMP%` | Ya, kecuali yang diubah dalam 24 jam terakhir |
-| Cache browser | `Cache` dan `Code Cache` per profil Chrome dan Edge, `cache2` per profil Firefox. Profil, sandi, dan bookmark tidak disentuh | Ya |
-| Crash dump dan log | `%LOCALAPPDATA%\CrashDumps`, `%LOCALAPPDATA%\Microsoft\Windows\WER` | Ya |
-| Data developer | npm cache, pip cache, Gradle caches, NuGet `v3-cache` | Ya |
-| Cache umum | `%USERPROFILE%\.cache` | Tidak |
-| Unduhan tidak lengkap | `.crdownload`, `.part`, `.partial` di `Downloads` | Ya, kecuali yang diubah dalam 24 jam terakhir |
-| Recycle Bin | Dikosongkan lewat API Windows | Tidak |
+| Temporary files | Contents of `%TEMP%` | Yes, except items changed in the last 24 hours |
+| Browser cache | `Cache` and `Code Cache` per Chrome and Edge profile, `cache2` per Firefox profile. Profiles, passwords, and bookmarks are not touched | Yes |
+| Crash dumps and logs | `%LOCALAPPDATA%\CrashDumps`, `%LOCALAPPDATA%\Microsoft\Windows\WER` | Yes |
+| Developer data | npm cache, pip cache, Gradle caches, NuGet `v3-cache` | Yes |
+| General cache | `%USERPROFILE%\.cache` | No |
+| Incomplete downloads | `.crdownload`, `.part`, `.partial` in `Downloads` | Yes, except items changed in the last 24 hours |
+| Recycle Bin | Emptied through the Windows API | No |
 
-Berkas yang sedang dipakai dilewati dan dilaporkan. Folder yang dikecualikan di Pengaturan tidak ditawarkan.
+Files in use are skipped and reported. Folders excluded in Settings are not offered.
 
-### Aplikasi
+### Apps
 
-Daftar aplikasi terpasang dibaca dari registry, dengan kolom nama, penerbit, ukuran, tanggal pasang, versi, dan pembaruan. Aplikasi di luar `Program Files` diberi tanda, tanpa diblokir.
+The list of installed apps comes from the registry, with columns for name, publisher, size, install date, version, and update. Apps outside `Program Files` get a mark but are not blocked.
 
-Uninstall menjalankan uninstaller resmi aplikasi supaya prosesnya terlihat. Setelah aplikasi tidak lagi terdaftar, sisa foldernya di `%APPDATA%`, `%LOCALAPPDATA%`, dan `%PROGRAMDATA%` ditawarkan tanpa ada yang tercentang, karena bisa berisi data pribadi. Folder penerbit seperti `%LOCALAPPDATA%\Google` tidak pernah ditawarkan.
+Uninstalling runs the app's official uninstaller, so you can see the process. Once the app is no longer registered, its leftover folders in `%APPDATA%`, `%LOCALAPPDATA%`, and `%PROGRAMDATA%` are offered with nothing ticked, because they can hold personal data. Publisher folders such as `%LOCALAPPDATA%\Google` are never offered.
 
-Tombol **Periksa winget** menambahkan penanda winget, aplikasi Microsoft Store, dan daftar pembaruan, yang dijalankan per aplikasi atas perintah Anda. Kalau winget meminta persetujuan sumber, teksnya ditampilkan dan hanya diterima setelah Anda menyetujuinya.
+The **Check winget** button adds winget marks, Microsoft Store apps, and the list of updates, which run per app when you ask. If winget asks for source agreement, the text is shown and accepted only after you agree.
 
-### Analisis
+### Analysis
 
-- **Terbesar:** berkas 100 MB ke atas di lokasi yang dipindai.
-- **Lama Tak Diubah:** berkas yang tidak diubah sejak 6 bulan, 1 tahun, atau 2 tahun. Area Windows dan Program Files disembunyikan kecuali Anda menampilkannya.
-- **Duplikat:** berkas 1 MiB ke atas dikelompokkan menurut ukuran, lalu hash SHA-256. Satu salinan tiap kelompok selalu tersisa dan diperiksa ulang tepat sebelum penghapusan. Hard link tidak dihitung sebagai duplikat.
+- **Largest:** files of 100 MB and up in the scanned location.
+- **Not changed in a while:** files unchanged for 6 months, 1 year, or 2 years. The Windows and Program Files areas stay hidden unless you show them.
+- **Duplicates:** files of 1 MiB and up are grouped by size, then by SHA-256 hash. One copy in each group always stays and is checked again right before deletion. Hard links do not count as duplicates.
 
-### Pengaturan
+### Settings
 
-Bahasa, tema (terang, gelap, atau mengikuti sistem), ambang "sudah lama", dan folder yang dikecualikan dari pemindaian. Disimpan di `%APPDATA%\Katharistis\settings.toml`.
+Language, theme (light, dark, or follow the system), the "old" threshold, and folders excluded from scans. Stored in `%APPDATA%\Katharistis\settings.toml`.
 
 ### CLI
 
 ```
-katharistis [opsi] [path]
+katharistis [options] [path]
 ```
 
-Tanpa `path`, yang dipindai adalah folder profil pengguna.
+Without a `path`, it scans your user profile folder.
 
-| Opsi | Arti | Bawaan |
+| Option | Meaning | Default |
 |---|---|---|
-| `-d <DEPTH>` | Kedalaman pohon yang ditampilkan | 1 |
-| `-n <TOP>` | Jumlah folder teratas per tingkat (0 = semua) | 20 |
-| `-f <FILES>` | Jumlah berkas terbesar yang didaftar (0 = mati) | 15 |
-| `-x` | Diterima tetapi tidak mengubah apa pun, karena pemindaian tidak pernah mengikuti link | |
-| `-j <THREADS>` | Jumlah thread pemindai | jumlah CPU x 4 |
+| `-d <DEPTH>` | Depth of the tree shown | 1 |
+| `-n <TOP>` | Number of top folders per level (0 = all) | 20 |
+| `-f <FILES>` | Number of largest files listed (0 = off) | 15 |
+| `-x` | Accepted but changes nothing, because scanning never follows links | |
+| `-j <THREADS>` | Number of scan threads | CPU count x 4 |
 
-## Aturan pemindaian
+## Scanning rules
 
-- Ukuran adalah ruang disk nyata (`GetCompressedFileSizeW`), jadi berkas terkompresi dan sparse terhitung benar.
-- Hard link dihitung sekali. Junction, symlink, dan mount point tidak diikuti.
-- Folder OneDrive tetap dipindai tanpa memicu unduhan. Berkas yang masih di cloud diberi tanda dan isinya tidak pernah dibaca, termasuk saat mencari duplikat.
-- Tanggal sebuah folder adalah tanggal terbaru dari seluruh isinya.
-- Folder yang gagal dibaca dicatat beserta alasannya, dan pemindaian tetap berjalan.
-- Pemindaian bisa dibatalkan, dan path di atas 260 karakter didukung.
+- Sizes are real disk space, read from the directory listing without opening each file, so compressed and sparse files count correctly.
+- Hard links count once. Junctions, symlinks, and mount points are not followed.
+- OneDrive folders are scanned without triggering downloads. Files still in the cloud get a mark and their contents are never read, including when looking for duplicates.
+- A folder's date is the newest date among everything inside it.
+- A folder that can't be read is recorded with the reason, and the scan continues.
+- Scans can be cancelled, and paths over 260 characters are supported.
 
-Satu pemindaian penuh drive berisi sekitar 3,6 juta berkas memakan sekitar 5,6 menit di mesin pengembang.
+A full scan of a 512 GB NVMe drive with about 3.6 million files took about 21 seconds and 1.3 GB of memory on the developer's machine, with the file system cache already warm. The first scan after a restart can take longer.
 
-## Aturan penghapusan
+## Deletion rules
 
-Semua penghapusan melewati satu fungsi di `katharistis-core`, dan selalu ada konfirmasi berisi jumlah item, total ukuran, dan mode hapus. Laporannya memisahkan berkas yang dipindahkan ke Recycle Bin, yang belum mengembalikan ruang disk, dari ruang yang benar-benar didapat. Ada tombol untuk mengosongkan Recycle Bin dari laporan itu, tanpa prompt Windows tambahan.
+All deletion goes through one function in `katharistis-core`, and there is always a confirmation with the item count, total size, and delete mode. The report separates files moved to the Recycle Bin, which have not given disk space back yet, from space actually gained. A button in that report empties the Recycle Bin, with no extra Windows prompt.
 
-Berkas atau folder yang tidak bisa masuk Recycle Bin (melebihi kuota, drive tanpa Recycle Bin, atau folder yang berisi link) tidak pernah dihapus begitu saja. Hapus permanen hanya terjadi setelah konfirmasi terpisah.
+A file or folder that can't enter the Recycle Bin (over the quota, a drive with no Recycle Bin, or a folder containing a link) is never just deleted. Permanent deletion happens only after a separate confirmation.
 
-Yang tidak bisa dihapus dari aplikasi ini:
+These can't be deleted from this app:
 
-- Akar drive, `C:\Windows` beserta isinya, `Program Files` beserta isinya, `C:\ProgramData` dan `C:\Users` sebagai folder, serta folder induk dari lokasi-lokasi itu.
+- Drive roots, `C:\Windows` and its contents, `Program Files` and its contents, `C:\ProgramData` and `C:\Users` as folders, and the parent folders of those locations.
 - `System Volume Information`, `$Recycle.Bin`, `pagefile.sys`, `hiberfil.sys`, `swapfile.sys`.
-- Berkas boot di akar drive Windows: `bootmgr`, `BOOTNXT`, `Boot`, `Recovery`, `EFI`.
-- Folder profil tiap pengguna dan folder standarnya sebagai folder utuh (`Documents`, `Desktop`, `Downloads`, `Pictures`, `Music`, `Videos`, `AppData`, `AppData\Local`, `AppData\Roaming`). Isinya boleh dihapus.
-- `.ssh` dan `.gnupg` beserta isinya, serta folder Katharistís sendiri.
+- Boot files at the root of the Windows drive: `bootmgr`, `BOOTNXT`, `Boot`, `Recovery`, `EFI`.
+- Each user's profile folder and its standard folders as whole folders (`Documents`, `Desktop`, `Downloads`, `Pictures`, `Music`, `Videos`, `AppData`, `AppData\Local`, `AppData\Roaming`). Their contents can be deleted.
+- `.ssh` and `.gnupg` with their contents, and Katharistís's own folder.
 
-Path dinormalkan dulu sebelum diperiksa, termasuk `\\?\`, huruf besar kecil, dan short name 8.3. Link dihapus sebagai tautannya, dan targetnya tidak disentuh. Item di dalam folder aplikasi terdaftar dan profil browser boleh dihapus, tetapi diberi tanda "dipakai aplikasi" dan peringatan di konfirmasi.
+Paths are normalized before the check, including `\\?\`, letter case, and 8.3 short names. A link is deleted as a link, and its target is not touched. Items inside a registered app's folder and browser profiles can be deleted, but they carry an "used by an app" mark and a warning in the confirmation.
 
-## Yang tidak dibuat
+## Not included
 
-Pembersih registry, "optimizer", skor kesehatan PC, penghapusan terjadwal atau otomatis, pembaruan otomatis aplikasi ini, dan dukungan macOS atau Linux.
+Registry cleaning, "optimizers", PC health scores, scheduled or automatic deletion, automatic updates of this app, and macOS or Linux support.
 
-## Jaringan
+## Network
 
-Katharistís tidak memakai jaringan dan tidak punya telemetri. Satu-satunya pengecualian adalah `winget` di layar Aplikasi, yang baru dijalankan setelah Anda menekan tombolnya.
+Katharistís does not use the network and has no telemetry. The one exception is `winget` on the Apps screen, which runs only after you press its button.
 
-## Peringatan SmartScreen
+## SmartScreen warning
 
-Binary tidak ditandatangani, jadi Windows SmartScreen bisa menampilkan peringatan saat pertama dijalankan. Pilih "More info" lalu "Run anyway" bila Anda mempercayai sumbernya.
+The binaries are not signed, so Windows SmartScreen may show a warning on first run. Choose "More info" and then "Run anyway" if you trust the source.
 
-## Struktur
+## Structure
 
-Workspace Cargo dengan tiga crate:
+A Cargo workspace with three crates:
 
-- `crates/core` (`katharistis-core`): pemindaian, treemap, aturan path, penghapusan, pembersihan, aplikasi, dan duplikat. Tidak bergantung pada GUI.
-- `crates/gui` (`katharistis-gui`): antarmuka `egui`.
-- `crates/cli` (`katharistis-cli`): program terminal.
+- `crates/core` (`katharistis-core`): scanning, treemap, path rules, deletion, cleanup, apps, and duplicates. It does not depend on the GUI.
+- `crates/gui` (`katharistis-gui`): the `egui` interface.
+- `crates/cli` (`katharistis-cli`): the terminal program.
 
-Dokumen desain ada di [`docs/superpowers/specs/2026-11-06-katharistis-design.md`](docs/superpowers/specs/2026-11-06-katharistis-design.md), dan rencana pengerjaannya di [`docs/superpowers/plans/2026-11-06-katharistis.md`](docs/superpowers/plans/2026-11-06-katharistis.md).
+The design document is at [`docs/superpowers/specs/2026-11-06-katharistis-design.md`](docs/superpowers/specs/2026-11-06-katharistis-design.md), and the implementation plan is at [`docs/superpowers/plans/2026-11-06-katharistis.md`](docs/superpowers/plans/2026-11-06-katharistis.md). Both are in Indonesian.
 
-## Asal dan lisensi
+## Origin and license
 
-Port dari [CleanBro](https://github.com/jetorbitdev/cleanbro), Copyright (C) 2026 gilang. Perilaku dan struktur mengikuti proyek itu.
+A port of [CleanBro](https://github.com/jetorbitdev/cleanbro), Copyright (C) 2026 gilang. Its behavior and structure follow that project.
 
-Dilisensikan di bawah GPL-3.0. Lihat berkas `LICENSE`.
+Licensed under GPL-3.0. See the `LICENSE` file.

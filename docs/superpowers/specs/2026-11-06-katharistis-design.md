@@ -145,9 +145,9 @@ Keluaran mengikuti versi Go: bar ukuran, persentase, sisa ruang volume, peringat
 
 ## Aturan pemindaian
 
-- Ukuran adalah ruang disk nyata, bukan ukuran logis. Pakai `GetCompressedFileSizeW`, supaya file terkompresi dan sparse benar.
+- Ukuran adalah ruang disk nyata, bukan ukuran logis, supaya file terkompresi dan sparse benar. Dibaca dari daftar folder (`FileIdExtdDirectoryInfo`) tanpa membuka tiap file, karena membuka tiap file memakan sekitar 90% waktu pindai. `GetCompressedFileSizeW` hanya dipakai untuk file yang daftar foldernya tidak memberi alokasi, atau pada file system tanpa informasi itu.
 - File placeholder OneDrive yang belum terunduh dihitung sebesar ruang yang benar-benar dipakai, dan diberi tanda "di cloud".
-- Hard link dihitung sekali, memakai file ID dan jumlah link.
+- Hard link dihitung sekali, memakai file ID.
 - Junction, symlink, dan mount point tidak diikuti. Reparse point jenis cloud (OneDrive) tetap dipindai tanpa memicu unduhan, karena kalau dilewati seluruh folder OneDrive tidak akan terhitung.
 - Pemindaian tidak pernah membaca isi file di cloud, termasuk saat mencari duplikat.
 - Tanggal terakhir diubah pada folder adalah tanggal terbaru dari seluruh isinya, karena tanggal bawaan folder tidak berubah saat isi di subfolder berubah.
